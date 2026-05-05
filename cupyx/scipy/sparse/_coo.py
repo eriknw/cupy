@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import warnings
+
 import numpy
 try:
     import scipy.sparse
@@ -58,9 +60,19 @@ class _coo_base(sparse_data._data_matrix):
                  *, maxprint=None):
         if maxprint is not None:
             self.maxprint = maxprint
-        if shape is not None and len(shape) != 2:
-            raise ValueError(
-                'Only two-dimensional sparse arrays are supported.')
+        if shape is not None:
+            if len(shape) != 2:
+                raise ValueError(
+                    'Only two-dimensional sparse arrays are supported.')
+            # Reject negative shapes up front so the (data, (row, col))
+            # branch surfaces a precise "non-negative" error rather than
+            # the much less obvious "row index exceeds matrix dimensions"
+            # that comes from ``row.max() >= shape[0]`` when ``shape[0]``
+            # is negative.
+            if not _util.isshape(shape, nonneg=True):
+                raise ValueError(
+                    'invalid shape (must be a 2-tuple of non-negative '
+                    'int)')
 
         if _base.issparse(arg1):
             x = arg1.asformat(self.format)
@@ -78,6 +90,13 @@ class _coo_base(sparse_data._data_matrix):
             self.has_canonical_format = x.has_canonical_format
 
         elif _util.isshape(arg1):
+            # See _compressed.py: dispatch on shape-likeness regardless
+            # of sign so negatives raise a precise message instead of
+            # falling through to the (data, (row, col)) branch.
+            if not _util.isshape(arg1, nonneg=True):
+                raise ValueError(
+                    'invalid shape (must be a 2-tuple of non-negative '
+                    'int)')
             m, n = arg1
             m, n = int(m), int(n)
             data = cupy.zeros(0, dtype if dtype else 'd')
@@ -127,6 +146,17 @@ class _coo_base(sparse_data._data_matrix):
             row, col = dense.nonzero()
             data = dense[row, col]
             shape = dense.shape
+            # Mirror scipy 1.17: the dense input branch picks the index
+            # dtype from the shape, *not* from ``cupy.nonzero``'s output.
+            # Without this downcast, ``coo_array(cupy.eye(3)).coords[0]``
+            # would be int64 (cupy.nonzero default) while scipy returns
+            # int32 -- a silent dtype divergence that propagates through
+            # arithmetic.  Skip ``check_contents``-style scans (the
+            # values are bounded by ``shape`` by construction).
+            forced_idx_dtype = _sputils.get_index_dtype(
+                maxval=max(shape) if max(shape) > 0 else None)
+            row = row.astype(forced_idx_dtype, copy=False)
+            col = col.astype(forced_idx_dtype, copy=False)
 
             self.has_canonical_format = True
 
@@ -177,8 +207,9 @@ class _coo_base(sparse_data._data_matrix):
         sparse_data._data_matrix.__init__(self, data)
         self.row = row
         self.col = col
-        if not _util.isshape(shape):
-            raise ValueError('invalid shape (must be a 2-tuple of int)')
+        if not _util.isshape(shape, nonneg=True):
+            raise ValueError(
+                'invalid shape (must be a 2-tuple of non-negative int)')
         self._shape = int(shape[0]), int(shape[1])
 
     @classmethod
@@ -194,7 +225,48 @@ class _coo_base(sparse_data._data_matrix):
         Args:
             has_canonical_format (bool): Defaults to ``False`` (not
                 known to be canonical).
+
+        Raises:
+            ValueError: If *data*, *row*, *col* lengths disagree, *row*
+                and *col* dtypes differ, or the index dtype is too
+                narrow for *shape*.  These mirror the ``_compressed``
+                checks; without them, mismatched-length buffers
+                silently corrupt cuSPARSE descriptors and downstream
+                conversions.
         """
+        # V2-8: ndim guard.  The public constructor enforces 1-D for
+        # ``data`` / ``row`` / ``col``; the ``_from_parts`` bypass
+        # had no such check.
+        if data.ndim != 1 or row.ndim != 1 or col.ndim != 1:
+            raise ValueError(
+                'data, row, and col must be 1-D, got ndim '
+                '{}, {}, {}'.format(data.ndim, row.ndim, col.ndim))
+        if data.size != row.size:
+            raise ValueError(
+                'data and row must have the same length, '
+                'got {} and {}'.format(data.size, row.size))
+        if data.size != col.size:
+            raise ValueError(
+                'data and col must have the same length, '
+                'got {} and {}'.format(data.size, col.size))
+        if row.dtype != col.dtype:
+            raise ValueError(
+                'row and col must have the same dtype, '
+                'got {} and {}'.format(row.dtype, col.dtype))
+        # Mirror the public constructor's nonneg-shape check.  CSR /
+        # CSC ``_from_parts`` enforce this implicitly via the
+        # ``indptr.size == major + 1`` check (negative major fails),
+        # but COO has no indptr so we have to check directly.
+        if shape[0] < 0 or shape[1] < 0:
+            raise ValueError(
+                'invalid shape (must be a 2-tuple of non-negative '
+                'int): got {}'.format(shape))
+        # Index dtype must be wide enough for the shape.
+        idx_max = numpy.iinfo(row.dtype).max
+        if shape[0] > idx_max or shape[1] > idx_max:
+            raise ValueError(
+                'shape {} too large for index dtype {} (max {})'
+                .format(shape, row.dtype, idx_max))
         A = cls.__new__(cls)
         sparse_data._data_matrix.__init__(A, data)
         A.row = row
@@ -279,6 +351,13 @@ class _coo_base(sparse_data._data_matrix):
         M, N = self.shape
         if (k > 0 and k >= N) or (k < 0 and -k >= M):
             raise ValueError("k exceeds matrix dimensions")
+        # Accept Python lists, scalars, numpy ndarrays, and cupy
+        # ndarrays (matches scipy 1.14+).
+        values = cupy.asarray(values, dtype=self.dtype)
+        # V2-6: 2-D values would later trip a confusing concatenate
+        # error.  Match scipy's clean message.
+        if values.ndim > 1:
+            raise ValueError('values must be 0-d or 1-d')
         if values.ndim and not len(values):
             return
         idx_dtype = self.row.dtype
@@ -320,11 +399,30 @@ class _coo_base(sparse_data._data_matrix):
         self.col = self.col[ind]
 
     def _getnnz(self, axis=None):
-        """Number of stored values, including explicit zeros."""
+        """Number of stored values, including explicit zeros.
+
+        Args:
+            axis ({None, 0, 1, -1, -2}): Axis along which to count
+                (``None`` totals the buffer; per-axis returns a 1-D
+                count vector).  Mirrors
+                :meth:`scipy.sparse._spbase.getnnz`.
+
+        Returns:
+            int or cupy.ndarray
+        """
         if axis is None:
             return self.data.size
-        else:
-            raise ValueError
+        if axis < 0:
+            axis += 2
+        if axis < 0 or axis >= 2:
+            raise ValueError('axis out of bounds')
+        out_dim = self.shape[1 - axis]
+        coord = self.col if axis == 0 else self.row
+        if coord.size == 0:
+            return cupy.zeros(out_dim, dtype=cupy.intp)
+        return cupy.bincount(
+            coord.astype(cupy.int64),
+            minlength=out_dim).astype(cupy.intp, copy=False)
 
     def count_nonzero(self, axis=None):
         """Number of non-zero entries.
@@ -350,11 +448,18 @@ class _coo_base(sparse_data._data_matrix):
             axis += 2
         if axis < 0 or axis >= 2:
             raise ValueError('axis out of bounds')
+        out_dim = self.shape[1 - axis]
+        # Empty / all-explicit-zero short-circuit -- ``cupy.bincount``
+        # raises on empty input even with ``minlength`` set, so we
+        # bypass that path for the trivial cases.
+        if self.data.size == 0:
+            return cupy.zeros(out_dim, dtype=cupy.intp)
         mask = self.data != 0
         coord = (self.col if axis == 0 else self.row)[mask]
+        if coord.size == 0:
+            return cupy.zeros(out_dim, dtype=cupy.intp)
         return cupy.bincount(
-            coord.astype(cupy.int64),
-            minlength=self.shape[1 - axis])
+            coord.astype(cupy.int64), minlength=out_dim)
 
     def get(self, stream=None):
         """Returns a copy of the array on host memory.
@@ -378,6 +483,36 @@ class _coo_base(sparse_data._data_matrix):
         else:
             sp_cls = scipy.sparse.coo_matrix
         return sp_cls((data, (row, col)), shape=self.shape)
+
+    def resize(self, *shape):
+        """Resize the array/matrix in-place to the given shape (F15).
+
+        Entries whose ``row >= new_M`` or ``col >= new_N`` are
+        dropped; new entries are not added.  ``shape`` may be passed
+        as ``(m, n)`` or ``m, n``.
+
+        Note: ``has_canonical_format`` is preserved.  Resize never
+        reorders entries and never introduces duplicates, so a
+        canonical (lex-sorted, dedup'd) COO stays canonical after
+        truncation.  Verified against scipy 1.17.
+
+        .. seealso:: :meth:`scipy.sparse.coo_array.resize`
+        """
+        new_shape = _sputils.check_shape(shape)
+        new_M, new_N = new_shape
+        # Drop entries that fall outside the new shape.  Both
+        # ``row < new_M`` and ``col < new_N`` must hold.
+        if self.row.size:
+            mask = (self.row < new_M) & (self.col < new_N)
+            if not bool(mask.all()):  # synchronize!
+                self.row = self.row[mask].copy()
+                self.col = self.col[mask].copy()
+                self.data = self.data[mask].copy()
+        self._shape = (int(new_M), int(new_N))
+        # NB: ``has_canonical_format`` is NOT invalidated -- resize
+        # never reorders entries and never introduces duplicates, so
+        # a canonical COO stays canonical (lex-sorted + dedup'd) and
+        # a non-canonical one stays non-canonical.
 
     def reshape(self, *shape, order='C'):
         """Gives a new shape to a sparse matrix without changing its data.
@@ -627,6 +762,60 @@ class _coo_base(sparse_data._data_matrix):
         if not isinstance(result, self._csr_container):
             result = self._csr_container(result)
         return result
+
+    def todia(self, copy=False):
+        """Convert this matrix to DIAgonal format.
+
+        Computes the offset of each non-zero (col - row) and packs
+        them into the SciPy DIA layout (``data[i, j]`` is the value at
+        ``(j - offsets[i], j)``).
+
+        The ``data`` buffer width matches scipy:
+        ``int(self.col.max()) + 1`` -- not ``max(M, N)`` -- so a
+        ``(2, 4)`` COO with non-zeros only in columns 0-1 stores a
+        ``(num_diags, 2)`` data array, mirroring scipy.
+
+        Emits :class:`SparseEfficiencyWarning` when the result has more
+        than 100 distinct diagonals (matches scipy: DIA is rarely the
+        right format above that).
+        """
+        # Sum duplicates so each (row, col) maps to a unique stored
+        # value -- otherwise multiple data entries collide on the same
+        # DIA slot and the last-write-wins.  Use a local ``src`` so we
+        # don't mutate ``self`` even when copy=False.
+        if self.has_canonical_format:
+            src = self
+        else:
+            src = self.copy()
+            src.sum_duplicates()
+        if src.data.size == 0:
+            return self._dia_container(
+                (cupy.zeros((0, 0), dtype=src.dtype),
+                 cupy.zeros(0, dtype=cupy.intp)),
+                shape=src.shape)
+        # int64 cast: ``col - row`` could overflow int32 for shapes
+        # near 2**31.  ``unique`` keeps the int64 dtype.
+        diags = (src.col.astype(cupy.int64)
+                 - src.row.astype(cupy.int64))
+        unique_diags, diag_idx = cupy.unique(diags, return_inverse=True)
+        n_diags = int(unique_diags.size)
+        if n_diags > 100:
+            warnings.warn(
+                f'Constructing a DIA matrix with {n_diags} diagonals '
+                'is inefficient',
+                _base.SparseEfficiencyWarning,
+                stacklevel=2)
+        # scipy recipe: ``data.shape[1] = col.max() + 1`` (only as wide
+        # as the rightmost stored entry).  synchronize!
+        width = int(src.col.max()) + 1
+        dia_data = cupy.zeros((n_diags, width), dtype=src.dtype)
+        dia_data[diag_idx.astype(cupy.intp),
+                 src.col.astype(cupy.intp)] = src.data
+        # Match the offsets dtype scipy picks: keep the (sorted) int64
+        # offsets array, which is the correct domain for diagonals
+        # ``-(M-1) .. (N-1)``.
+        return self._dia_container(
+            (dia_data, unique_diags), shape=src.shape)
 
     def transpose(self, axes=None, copy=False):
         """Returns a transpose matrix.

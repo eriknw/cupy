@@ -95,10 +95,14 @@ class _csr_base(_compressed._compressed_sparse_matrix):
                 # Keep only True entries (filter explicit False).
                 mask = new_data
                 if mask.all():  # synchronize!
+                    # _skip_buffer_check: same length as self.data /
+                    # self.indices; indptr unchanged from self (tight
+                    # by construction).
                     return cls._from_parts(
                         new_data, self.indices.copy(),
                         self.indptr.copy(), self.shape,
-                        has_sorted_indices=True)
+                        has_sorted_indices=True,
+                        _skip_buffer_check=True)
                 from cupyx.cusparse import (
                     _indptr_to_coo, _build_indptr)
                 idx_dtype = self.indices.dtype
@@ -108,9 +112,12 @@ class _csr_base(_compressed._compressed_sparse_matrix):
                 data = new_data[mask]
                 M = self._swap(*self.shape)[0]
                 indptr = _build_indptr(rows, M, idx_dtype)
+                # _skip_buffer_check: ``_build_indptr`` produces an
+                # indptr whose last entry == len(rows) == data.size.
                 return cls._from_parts(
                     data, cols, indptr, self.shape,
-                    has_sorted_indices=True)
+                    has_sorted_indices=True,
+                    _skip_buffer_check=True)
             # Slow path: op(0, scalar) is True, so unstored entries
             # contribute.  Fall through to binopt_csr which expands
             # to O(m*n).  This is unavoidable when the result is
@@ -127,11 +134,15 @@ class _csr_base(_compressed._compressed_sparse_matrix):
                 .format(scalar, sym, alt),
                 _base.SparseEfficiencyWarning)
             idx_dtype = self.indices.dtype
+            # _skip_buffer_check: data has size 1 == indptr[-1] = 1
+            # (the (1, 1) shape with one stored entry; tight by
+            # construction).
             other = cls._from_parts(
                 data,
                 cupy.zeros((1,), dtype=idx_dtype),
                 cupy.arange(2, dtype=idx_dtype),
-                (1, 1))
+                (1, 1),
+                _skip_buffer_check=True)
             return binopt_csr(self, other, op_name)
         elif _util.isdense(other):
             return op(self.todense(), other)
@@ -154,6 +165,13 @@ class _csr_base(_compressed._compressed_sparse_matrix):
             res = binopt_csr(self, other, opposite_op_name)
             out = cupy.logical_not(res.toarray())
             return cls(out)
+        elif _base.issparse(other):
+            # V2-23: non-CSR sparse second operand (CSC / COO / DIA).
+            # ``_add_sparse`` and ``multiply`` already handle this case
+            # by routing through ``other.tocsr()``; the comparison /
+            # maximum / minimum paths missed the same fallback.  Drop
+            # to CSR and retry.
+            return self._comparison(other.tocsr(), op, op_name)
         raise NotImplementedError
 
     def __eq__(self, other):
@@ -185,12 +203,17 @@ class _csr_base(_compressed._compressed_sparse_matrix):
         target = self._csr_container
         if type(result) is target or not _is_csr(result):
             return result
+        # _skip_buffer_check: ``result`` is a CSR built by cuSPARSE
+        # (or the pure-CuPy spgemm fallback) which produces tight
+        # buffers; we're just rewrapping in the target array/matrix
+        # kind without touching the buffers.
         return target._from_parts(
             result.data, result.indices, result.indptr, result.shape,
             has_canonical_format=getattr(
                 result, '_has_canonical_format', None),
             has_sorted_indices=getattr(
-                result, '_has_sorted_indices', None))
+                result, '_has_sorted_indices', None),
+            _skip_buffer_check=True)
 
     def _matmul_dispatch(self, other):
         from cupyx import cusparse
@@ -272,9 +295,13 @@ class _csr_base(_compressed._compressed_sparse_matrix):
         else:
             return NotImplemented
 
-    def _mul_scalar(self, other):
-        self.sum_duplicates()
-        return self._with_data(self.data * other)
+    # ``_mul_scalar`` is inherited from ``_data._data_matrix``, which
+    # implements the scipy-aligned ``self._with_data(self.data *
+    # other)`` recipe (with the dtype upcast for bool*int, M11).
+    # The previous CSR override called ``self.sum_duplicates()``
+    # eagerly, which mutated ``self`` even when the caller wasn't
+    # going to read it back -- a side effect scipy doesn't have, and
+    # a wasted kernel for canonical CSRs (the common case).
 
     def __div__(self, other):
         raise NotImplementedError
@@ -285,12 +312,21 @@ class _csr_base(_compressed._compressed_sparse_matrix):
     def __truediv__(self, other):
         """Point-wise division by another matrix, vector or scalar"""
         if _util.isscalarlike(other):
+            # Apply the float32 -> float64 upcast first so the
+            # result_type below still picks up complex promotion (e.g.
+            # ``float32 / complex64 -> complex128``).  Then promote
+            # out-of-set dtypes to float64 to fix V2-9: ``bool_csr / 2``
+            # used to compute ``cupy.reciprocal(2, dtype=int64) = 0``
+            # and silently return an all-zero result.
             dtype = self.dtype
             if dtype == numpy.float32:
-                # Note: This is a work-around to make the output dtype the same
-                # as SciPy. It might be SciPy version dependent.
+                # cupy: ``float32 / Python int -> float32``; scipy
+                # upcasts to float64 on division.  Preserve scipy
+                # behaviour (the original CSR override had this too).
                 dtype = numpy.float64
-            dtype = cupy.result_type(dtype, other)
+            dtype = numpy.result_type(dtype, other)
+            if dtype.char not in '?fdFD':
+                dtype = numpy.dtype(numpy.float64)
             d = cupy.reciprocal(other, dtype=dtype)
             return multiply_by_scalar(self, d)
         elif _util.isdense(other):
@@ -380,13 +416,16 @@ class _csr_base(_compressed._compressed_sparse_matrix):
                 self.sum_duplicates()
                 new_data = cupy_op(self.data, other)
                 new_data = new_data.astype(dtype, copy=False)
+                # _skip_buffer_check: indptr is unchanged from self;
+                # new_data has same length as self.data.
                 return cls._from_parts(
                     new_data, self.indices, self.indptr,
                     self.shape,
                     has_canonical_format=getattr(
                         self, '_has_canonical_format', None),
                     has_sorted_indices=getattr(
-                        self, '_has_sorted_indices', None))
+                        self, '_has_sorted_indices', None),
+                    _skip_buffer_check=True)
         elif _util.isdense(other):
             self.sum_duplicates()
             other = cupy.atleast_2d(other)
@@ -395,6 +434,14 @@ class _csr_base(_compressed._compressed_sparse_matrix):
             self.sum_duplicates()
             other.sum_duplicates()
             return binopt_csr(self, other, op_name)
+        elif _base.issparse(other):
+            # V2-23: non-CSR sparse second operand.  ``_add_sparse``
+            # and ``multiply`` already convert via ``tocsr()``; do
+            # the same here so ``csr.maximum(coo)`` /
+            # ``csr.minimum(csc)`` work instead of raising
+            # NotImplementedError.
+            return self._maximum_minimum(
+                other.tocsr(), cupy_op, op_name, dense_check)
         raise NotImplementedError
 
     def maximum(self, other):
@@ -432,7 +479,17 @@ class _csr_base(_compressed._compressed_sparse_matrix):
         x_len = min(rows - row_st, cols - col_st)
         if x_len <= 0:
             raise ValueError('k exceeds matrix dimensions')
-        values = values.astype(self.dtype)
+        # Accept Python lists, scalars, numpy ndarrays, and cupy
+        # ndarrays (matches scipy 1.14+).  ``cupy.asarray(...,
+        # dtype=...)`` is a no-op when the input is already a cupy
+        # ndarray of the right dtype, so the subsequent subtraction
+        # must be out-of-place to avoid mutating the caller's array
+        # through the slice view.
+        values = cupy.asarray(values, dtype=self.dtype)
+        # V2-6: 2-D values would later trip a confusing concatenate
+        # / broadcast error.  Match scipy's clean message.
+        if values.ndim > 1:
+            raise ValueError('values must be 0-d or 1-d')
         if values.ndim == 0:
             # broadcast
             x_data = cupy.full((x_len,), values, dtype=self.dtype)
@@ -445,9 +502,13 @@ class _csr_base(_compressed._compressed_sparse_matrix):
         x_indptr[row_st:row_st+x_len+1] = cupy.arange(
             x_len+1, dtype=idx_dtype)
         x_indptr[row_st+x_len+1:] = x_len
-        x_data -= self.diagonal(k=k)[:x_len]
+        x_data = x_data - self.diagonal(k=k)[:x_len]
+        # _skip_buffer_check: x_data has length x_len, x_indices
+        # ditto, and x_indptr was built with ``x_indptr[-1] = x_len``
+        # by the loop above -- tight by construction.
         y = self + type(self)._from_parts(
-            x_data, x_indices, x_indptr, self.shape)
+            x_data, x_indices, x_indptr, self.shape,
+            _skip_buffer_check=True)
         self.data = y.data
         self.indices = y.indices
         self.indptr = y.indptr
@@ -471,7 +532,10 @@ class _csr_base(_compressed._compressed_sparse_matrix):
         Args:
             order ({'C', 'F', None}): Whether to store data in C (row-major)
                 order or F (column-major) order. Default is C-order.
-            out: Not supported.
+            out (cupy.ndarray, optional): If provided, the dense output is
+                written into ``out`` in-place and ``out`` is returned.
+                Must match ``self.shape`` and ``self.dtype``.  Mirrors
+                :meth:`scipy.sparse.csr_matrix.toarray`.
 
         Returns:
             cupy.ndarray: Dense array representing the same matrix.
@@ -481,35 +545,34 @@ class _csr_base(_compressed._compressed_sparse_matrix):
         """
         from cupyx import cusparse
 
+        _base._check_order_out_compat(order, out)
         order = 'C' if order is None else order.upper()
+        if order not in ('C', 'F'):
+            raise ValueError('order not understood')
         if self.nnz == 0:
-            return cupy.zeros(shape=self.shape, dtype=self.dtype, order=order)
-
-        if self.dtype.char not in 'fdFD':
-            return csr2dense(self, order)
-
-        x = self.copy()
-        x.has_canonical_format = False  # need to enforce sum_duplicates
-        x.sum_duplicates()
-        if (cusparse.check_availability('sparseToDense')
-                and (not runtime.is_hip or (x.nnz > 0))):
-            # On HIP, nnz=0 is problematic as of ROCm 4.2.0
-            y = cusparse.sparseToDense(x)
-            if order == 'F':
-                return y
-            elif order == 'C':
-                return cupy.ascontiguousarray(y)
-            else:
-                raise ValueError('order not understood')
+            result = cupy.zeros(
+                shape=self.shape, dtype=self.dtype, order=order)
+        elif self.dtype.char not in 'fdFD':
+            result = csr2dense(self, order)
         else:
-            # csr2dense returns F-contiguous array.
-            if order == 'C':
-                # To return C-contiguous array, it uses transpose.
-                return cusparse.csc2dense(x.T).T
-            elif order == 'F':
-                return cusparse.csr2dense(x)
+            x = self.copy()
+            x.has_canonical_format = False  # enforce sum_duplicates below
+            x.sum_duplicates()
+            if (cusparse.check_availability('sparseToDense')
+                    and (not runtime.is_hip or (x.nnz > 0))):
+                # On HIP, nnz=0 is problematic as of ROCm 4.2.0
+                y = cusparse.sparseToDense(x)
+                # sparseToDense returns F-contiguous; flip if user
+                # asked for C-order.
+                result = y if order == 'F' else cupy.ascontiguousarray(y)
             else:
-                raise ValueError('order not understood')
+                # csr2dense / csc2dense return F-contiguous arrays.
+                if order == 'C':
+                    # To return C-contiguous, transpose CSC2dense output.
+                    result = cusparse.csc2dense(x.T).T
+                else:  # 'F'
+                    result = cusparse.csr2dense(x)
+        return _base._into_out(result, out, self.shape, self.dtype)
 
     def tobsr(self, blocksize=None, copy=False):
         # TODO(unno): Implement tobsr
@@ -589,8 +652,12 @@ class _csr_base(_compressed._compressed_sparse_matrix):
         return self.tocsc()
 
     def todia(self, copy=False):
-        # TODO(unno): Implement todia
-        raise NotImplementedError
+        """Convert this matrix to DIAgonal format.
+
+        Routes through COO so the same code path covers both CSR and
+        CSC entry points (CSC.todia inherits from _spbase.todia).
+        """
+        return self.tocoo(copy=copy).todia(copy=False)
 
     def todok(self, copy=False):
         # TODO(unno): Implement todok
@@ -624,12 +691,16 @@ class _csr_base(_compressed._compressed_sparse_matrix):
             indptr = self.indptr.copy()
         else:
             data, indices, indptr = self.data, self.indices, self.indptr
+        # _skip_buffer_check: transpose reuses self's indices/indptr
+        # arrays (or copies of them); the buffer invariant is
+        # inherited inductively.
         return self._csc_container._from_parts(
             data, indices, indptr, shape,
             has_canonical_format=getattr(
                 self, '_has_canonical_format', None),
             has_sorted_indices=getattr(
-                self, '_has_sorted_indices', None))
+                self, '_has_sorted_indices', None),
+            _skip_buffer_check=True)
 
     def _getrow(self, i):
         """Return a copy of row i as a (1 x n) CSR row vector."""
@@ -748,13 +819,22 @@ def check_shape_for_pointwise_op(a_shape, b_shape, allow_broadcasting=True):
 
 
 def multiply_by_scalar(sp, a):
-    data = sp.data * a
+    # Promote out of int64 / int32 to a sparse-supported dtype (?fdFD)
+    # -- CSR/CSC don't accept int64 data, and ``bool * 2`` would
+    # otherwise produce an int64 sparse object that can't be passed to
+    # any other sparse op.  ``copy=False`` makes the astype a no-op
+    # when the dtype already matches.
+    new_dtype = numpy.result_type(sp.dtype, a)
+    if new_dtype.char not in '?fdFD':
+        new_dtype = numpy.float64
+    data = sp.data.astype(new_dtype, copy=False) * a
     return type(sp)._from_parts(
         data, sp.indices.copy(), sp.indptr.copy(), sp.shape,
         has_canonical_format=getattr(
             sp, '_has_canonical_format', None),
         has_sorted_indices=getattr(
-            sp, '_has_sorted_indices', None))
+            sp, '_has_sorted_indices', None),
+        _skip_buffer_check=True)
 
 
 def multiply_by_dense(sp, dn):
@@ -784,8 +864,12 @@ def multiply_by_dense(sp, dn):
         dn, it(dn_m), it(dn_n), indptr, it(m), it(n),
         data, indices)
 
+    # _skip_buffer_check: ``data`` / ``indices`` are sized to ``nnz``
+    # above; ``indptr`` either equals ``arange(0, nnz+1, ...)`` or
+    # ``sp.indptr * n`` -- in both branches ``indptr[-1] == nnz``.
     return type(sp)._from_parts(
-        data, indices, indptr, shape=(m, n))
+        data, indices, indptr, shape=(m, n),
+        _skip_buffer_check=True)
 
 
 _GET_ROW_ID_ = '''
@@ -889,40 +973,53 @@ def multiply_by_csr(a, b):
     b_nnz = b.nnz * (m // b_m) * (n // b_n)
     if a_nnz > b_nnz:
         return multiply_by_csr(b, a)
+    # V2-22: harmonise index dtypes so the kernel's templated ``I``
+    # parameter is consistent across both operands.  Without this,
+    # ``mixed = csr_int32.multiply(csr_int64)`` raises
+    # ``TypeError: Type is mismatched. B_INDPTR int32 int64 I``.
+    # Mirrors the harmonisation already done in ``binopt_csr``.
+    idx_dtype = numpy.result_type(a.indices.dtype, b.indices.dtype)
+    a_indices = a.indices.astype(idx_dtype, copy=False)
+    a_indptr = a.indptr.astype(idx_dtype, copy=False)
+    b_indices = b.indices.astype(idx_dtype, copy=False)
+    b_indptr = b.indptr.astype(idx_dtype, copy=False)
     c_nnz = a_nnz
     dtype = numpy.promote_types(a.dtype, b.dtype)
     c_data = cupy.empty(c_nnz, dtype=dtype)
-    c_indices = cupy.empty(c_nnz, dtype=a.indices.dtype)
+    c_indices = cupy.empty(c_nnz, dtype=idx_dtype)
     if m > a_m:
         if n > a_n:
-            c_indptr = cupy.arange(0, c_nnz+1, n, dtype=a.indptr.dtype)
+            c_indptr = cupy.arange(0, c_nnz+1, n, dtype=idx_dtype)
         else:
-            c_indptr = cupy.arange(0, c_nnz+1, a.nnz, dtype=a.indptr.dtype)
+            c_indptr = cupy.arange(0, c_nnz+1, a.nnz, dtype=idx_dtype)
     else:
-        c_indptr = a.indptr.copy()
+        c_indptr = a_indptr.copy()
         if n > a_n:
             c_indptr *= n
-    flags = cupy.zeros(c_nnz+1, dtype=a.indices.dtype)
-    nnz_each_row = cupy.zeros(m+1, dtype=a.indptr.dtype)
+    flags = cupy.zeros(c_nnz+1, dtype=idx_dtype)
+    nnz_each_row = cupy.zeros(m+1, dtype=idx_dtype)
 
     # compute c = a * b where necessary and get sparsity pattern of matrix d
-    it = a.indptr.dtype.type
+    it = idx_dtype.type
     cupy_multiply_by_csr_step1()(
-        a.data, a.indptr, a.indices, it(a_m), it(a_n),
-        b.data, b.indptr, b.indices, it(b_m), it(b_n),
+        a.data, a_indptr, a_indices, it(a_m), it(a_n),
+        b.data, b_indptr, b_indices, it(b_m), it(b_n),
         c_indptr, it(m), it(n), c_data, c_indices, flags, nnz_each_row)
 
-    flags = cupy.cumsum(flags, dtype=a.indptr.dtype)
-    d_indptr = cupy.cumsum(nnz_each_row, dtype=a.indptr.dtype)
+    flags = cupy.cumsum(flags, dtype=idx_dtype)
+    d_indptr = cupy.cumsum(nnz_each_row, dtype=idx_dtype)
     d_nnz = int(d_indptr[-1])  # synchronize!
     d_data = cupy.empty(d_nnz, dtype=dtype)
-    d_indices = cupy.empty(d_nnz, dtype=a.indices.dtype)
+    d_indices = cupy.empty(d_nnz, dtype=idx_dtype)
 
     # remove zero elements in matrix c
     cupy_multiply_by_csr_step2()(c_data, c_indices, flags, d_data, d_indices)
 
+    # _skip_buffer_check: d_nnz was read from d_indptr[-1] above and
+    # used to size d_data / d_indices, so the tight invariant holds.
     return type(a)._from_parts(
-        d_data, d_indices, d_indptr, shape=(m, n))
+        d_data, d_indices, d_indptr, shape=(m, n),
+        _skip_buffer_check=True)
 
 
 @cupy._util.memoize(for_each_device=True)
@@ -1100,8 +1197,11 @@ def binopt_csr(a, b, op_name):
         a_info, a_valid, a_tmp_indices, a_tmp_data, it(a_nnz),
         b_info, b_valid, b_tmp_indices, b_tmp_data, it(b_nnz),
         c_indices, c_data, size=_size)
+    # _skip_buffer_check: c_nnz read from c_indptr[-1]; c_data and
+    # c_indices sized to c_nnz, so the invariant is tight.
     return type(a)._from_parts(
-        c_data, c_indices, c_indptr, shape=(m, n))
+        c_data, c_indices, c_indptr, shape=(m, n),
+        _skip_buffer_check=True)
 
 
 @cupy._util.memoize(for_each_device=True)
@@ -1339,8 +1439,13 @@ def dense2csr(a):
     indices = cupy.empty(nnz, dtype=idx_dtype)
     data = cupy.empty(nnz, dtype=a.dtype)
     cupy_dense2csr_step2()(it(m), it(n), a, info, indices, data)
+    # _skip_buffer_check: nnz was already read from indptr[-1] above
+    # (see the synchronize! comment) and ``data`` is sized to nnz, so
+    # data.size == int(indptr[-1]) is tight by construction.  Skipping
+    # the redundant validation also avoids re-reading indptr[-1].
     return csr_matrix._from_parts(  # dense2csr always returns csr_matrix
-        data, indices, indptr, (m, n))
+        data, indices, indptr, (m, n),
+        _skip_buffer_check=True)
 
 
 @cupy._util.memoize(for_each_device=True)

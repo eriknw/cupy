@@ -3185,18 +3185,29 @@ class TestInt64Conversions:
 class TestInt64Bmat:
     """bmat preserves int64 with sparse, mixed, and dense blocks."""
 
+    @staticmethod
+    def _idx_dtype(m):
+        # ``bmat`` may return csr / csc / coo depending on whether the
+        # inputs unanimously share a CSR/CSC format (F6 fix).  Probe
+        # whichever index attribute is present.
+        if m.format == 'coo':
+            return m.row.dtype
+        return m.indices.dtype
+
     def test_bmat(self):
         a = _make_int64_csr(10, 10, density=0.2)
         b = _make_int64_csr(10, 15, density=0.2)
-        # Horizontal concat
+        # Horizontal concat -- all-CSR inputs now propagate to a CSR
+        # output (F6); previously dropped to COO.
         c = sparse.bmat([[a, b]])
-        assert c.row.dtype == cupy.int64
+        assert self._idx_dtype(c) == cupy.int64
         cupy.testing.assert_allclose(
             c.toarray(),
             cupy.concatenate([a.toarray(), b.toarray()], axis=1))
         # Mixed int32 + int64 → int64
         a32 = sparse.random(10, 10, density=0.2, format='csr')
-        assert sparse.bmat([[a32, b]]).row.dtype == cupy.int64
+        assert self._idx_dtype(
+            sparse.bmat([[a32, b]])) == cupy.int64
         # Dense block alongside sparse int64
         d = cupy.eye(10, dtype=cupy.float64)
         r = sparse.bmat([[a, d], [d, a]])
@@ -3439,14 +3450,21 @@ class TestBmatIndexDtypeDetection:
             result = sparse.bmat([[d]])
         except cupy.cuda.memory.OutOfMemoryError:
             pytest.skip('not enough GPU memory for arange(2**31+1)')
-        assert result.row.dtype == cupy.int64
+        # ``bmat`` may return csr / csc / coo depending on input
+        # formats (F6 fix).  Probe the appropriate attribute.
+        idx = (result.row.dtype if result.format == 'coo'
+               else result.indices.dtype)
+        assert idx == cupy.int64
         assert result.shape == (2**31 + 1, 1)
         assert result.nnz == 1
 
     def test_bmat_all_int32_stays_int32(self):
         csr = sparse.csr_matrix(cupy.eye(3, dtype=cupy.float64))
+        # F6 fix: all-CSR bmat now returns csr_matrix (not coo).
         result = sparse.bmat([[csr, csr]])
-        assert result.row.dtype == cupy.int32
+        idx = (result.row.dtype if result.format == 'coo'
+               else result.indices.dtype)
+        assert idx == cupy.int32
 
 
 class TestAddAtNegativeInt64:

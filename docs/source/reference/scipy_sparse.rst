@@ -8,6 +8,63 @@ Sparse matrices (:mod:`cupyx.scipy.sparse`)
 CuPy supports sparse matrices using `cuSPARSE <https://developer.nvidia.com/cusparse>`_.
 These matrices have the same interfaces of `SciPy's sparse matrices <https://docs.scipy.org/doc/scipy/reference/sparse.html>`_.
 
+Matrix vs array semantics
+-------------------------
+
+CuPy mirrors SciPy's split between **sparse matrix** classes
+(``csr_matrix``, ``csc_matrix``, ``coo_matrix``, ``dia_matrix``) with
+legacy ``numpy.matrix`` semantics, and **sparse array** classes
+(``csr_array``, ``csc_array``, ``coo_array``, ``dia_array``) with
+``numpy.ndarray`` semantics:
+
+* ``*`` is matrix multiplication on matrices, element-wise on arrays.
+* ``**`` is matrix power on matrices, element-wise on arrays.
+* ``@`` is matrix multiplication on both kinds.
+
+The sparse-array surface preserves the array-vs-matrix kind through
+arithmetic, indexing, and conversions.  Construction helpers ending
+in ``_array`` (``eye_array``, ``diags_array``, ``random_array``,
+``block_array``) return sparse arrays; the older helpers (``eye``,
+``diags``, ``random``, ``bmat``) return sparse matrices.  See
+`SciPy's migration guide
+<https://docs.scipy.org/doc/scipy/reference/sparse.migration_to_sparray.html>`_
+for porting guidance.
+
+2-D-only constraint (vs. SciPy 1.17+)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+CuPy sparse arrays are **2-D only**.  Operations that would yield a
+1-D result in SciPy 1.17 instead return a 2-D ``(1, N)`` or
+``(N, 1)`` shape in CuPy:
+
+* Row indexing: ``A[0]`` and ``A[0, :]`` return a ``(1, N)`` sparse
+  array (SciPy: ``(N,)``).
+* Column indexing: ``A[:, 0]`` returns ``(M, 1)`` (SciPy: ``(M,)``).
+* Reductions: ``A.sum(axis=0)`` returns ``(1, N)`` ``ndarray``
+  (SciPy: ``(N,)``).
+* Iteration: ``for row in A:`` yields ``(1, N)`` rows (SciPy: ``(N,)``).
+
+Code that relies on the 1-D shape from SciPy 1.17 needs to call
+``.ravel()`` / ``.squeeze()`` on the CuPy result.
+
+Data dtype divergence: bool / int promotion
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+cuSPARSE-backed operations only accept ``bool``, ``float32``,
+``float64``, ``complex64`` or ``complex128`` for the ``data`` buffer.
+NumPy promotion rules can land outside that set -- e.g.,
+``bool_sparse * 2`` would naturally produce ``int64`` data.  CuPy
+upcasts the result to ``float64`` so subsequent ``+`` / ``@`` /
+``toarray`` keep working::
+
+    >>> A = csp.csr_array(cp.array([[True, False], [False, True]]))
+    >>> (A * 2).dtype
+    dtype('float64')      # SciPy: int64
+
+If you need integer-typed data, cast explicitly via
+``A.astype(numpy.float64) * 2`` (no-op when already float) or work
+on a dense copy.
+
 Index dtype (int32 / int64)
 ---------------------------
 
@@ -78,6 +135,22 @@ Sparse matrix classes
    dia_matrix
    spmatrix
 
+Sparse array classes
+~~~~~~~~~~~~~~~~~~~~
+
+Mirror the matrix classes but follow NumPy semantics (``*``
+element-wise, ``@`` matmul).  Recommended for new code (matches SciPy
+1.17 sparse-array surface).
+
+.. autosummary::
+   :toctree: generated/
+
+   coo_array
+   csc_array
+   csr_array
+   dia_array
+   sparray
+
 
 Functions
 ~~~~~~~~~
@@ -100,6 +173,33 @@ Building sparse matrices:
    vstack
    rand
    random
+
+Building sparse arrays:
+
+.. autosummary::
+   :toctree: generated/
+
+   eye_array
+   diags_array
+   block_array
+   random_array
+
+Manipulating sparse arrays:
+
+.. autosummary::
+   :toctree: generated/
+
+   matrix_transpose
+   permute_dims
+   swapaxes
+
+Index dtype helpers (re-exported from :mod:`scipy.sparse`):
+
+.. autosummary::
+   :toctree: generated/
+
+   get_index_dtype
+   safely_cast_index_arrays
 
 
 Sparse matrix tools:

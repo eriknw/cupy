@@ -84,12 +84,29 @@ def _indptr_to_coo(indptr, dtype=None):
     """Expand compressed ``indptr`` to per-nnz major-axis indices.
 
     Inverse of :func:`_build_indptr`.  ``dtype`` defaults to ``indptr.dtype``.
+
+    Memory: O(nnz) -- the prior ``cupy.repeat(arange(nrows),
+    diff(indptr))`` recipe allocated an O(nrows) temporary
+    ``arange``.  For very tall, sparse matrices (e.g. shape
+    ``(2**31+3, 2)`` with nnz=1) that's a multi-GB temporary;
+    ``searchsorted(indptr[1:], arange(nnz), side='right')`` produces
+    the same per-nnz major-axis index in O(nnz log nrows) time and
+    O(nnz) memory.  Cost: one D2H sync to read ``int(indptr[-1])``.
+    synchronize!
     """
     if dtype is None:
         dtype = indptr.dtype
-    nrows = indptr.shape[0] - 1
-    return _cupy.repeat(
-        _cupy.arange(nrows, dtype=dtype), _cupy.diff(indptr))
+    if indptr.size == 0:
+        # Degenerate input -- ``indptr[-1]`` would raise IndexError.
+        # Legacy implementation produced an empty array here too via
+        # ``repeat(arange(-1), diff(empty)) == empty``.
+        return _cupy.zeros(0, dtype=dtype)
+    nnz = int(indptr[-1])  # synchronize!
+    if nnz == 0:
+        return _cupy.zeros(0, dtype=dtype)
+    return _cupy.searchsorted(
+        indptr[1:], _cupy.arange(nnz, dtype=dtype),
+        side='right').astype(dtype, copy=False)
 
 
 def _build_indptr(row_indices, n_rows, dtype):
@@ -116,13 +133,16 @@ def _with_indices_dtype(m, dtype):
         return m
     # Read private attrs to avoid triggering the lazy property getter
     # (GPU kernel + D2H sync) when the flags have not been computed.
+    # _skip_buffer_check: m's buffer was tight; astype preserves
+    # data.size and indptr[-1] => result inherits the invariant.
     return m.__class__._from_parts(
         m.data, m.indices.astype(dtype), m.indptr.astype(dtype),
         m.shape,
         has_canonical_format=getattr(
             m, '_has_canonical_format', None),
         has_sorted_indices=getattr(
-            m, '_has_sorted_indices', None))
+            m, '_has_sorted_indices', None),
+        _skip_buffer_check=True)
 
 
 def _transpose_flag(trans):
@@ -620,7 +640,7 @@ def csrgeam(a, b, alpha=1, beta=1):
 
     c = cupyx.scipy.sparse.csr_matrix(
         (c_data, c_indices, c_indptr), shape=a.shape)
-    c._has_canonical_format = True
+    c.has_canonical_format = True  # propagates to has_sorted_indices
     return c
 
 
@@ -728,7 +748,7 @@ def csrgeam2(a, b, alpha=1, beta=1):
 
     c = cupyx.scipy.sparse.csr_matrix(
         (c_data, c_indices, c_indptr), shape=a.shape)
-    c._has_canonical_format = True
+    c.has_canonical_format = True  # propagates to has_sorted_indices
     return c
 
 
@@ -783,10 +803,14 @@ def spgeam(a, b, alpha=1, beta=1):
 
     # Build an empty C with the right index dtype so SpMatDescr carries it.
     # Use _from_parts to preserve int64 (public constructor downcasts).
+    # _skip_buffer_check: c_indptr is uninitialized (cuSPARSE will fill
+    # it during spGEAM_nnz); reading indptr[-1] here would observe
+    # garbage and may spuriously fail the validation check.
     c_indptr = _cupy.empty(m + 1, dtype=idx_dtype)
     c = cupyx.scipy.sparse.csr_matrix._from_parts(
         _cupy.empty(0, a.dtype), _cupy.empty(0, idx_dtype),
-        c_indptr, (m, n))
+        c_indptr, (m, n),
+        _skip_buffer_check=True)
 
     mat_a = SpMatDescriptor.create(a)
     mat_b = SpMatDescriptor.create(b)
@@ -837,9 +861,13 @@ def spgeam(a, b, alpha=1, beta=1):
     finally:
         _cusparse.spGEAM_destroyDescr(desc)
 
+    # _skip_buffer_check: c_data / c_indices were sized to c_nnz from
+    # spMatGetSize, and c_indptr was filled by cuSPARSE such that
+    # c_indptr[-1] == c_nnz.  Tight by construction.
     c = cupyx.scipy.sparse.csr_matrix._from_parts(
         c_data, c_indices, c_indptr, (m, n),
-        has_canonical_format=True)
+        has_canonical_format=True,
+        _skip_buffer_check=True)
     return c
 
 
@@ -913,7 +941,7 @@ def csrgemm(a, b, transa=False, transb=False):
 
     c = cupyx.scipy.sparse.csr_matrix(
         (c_data, c_indices, c_indptr), shape=(m, n))
-    c._has_canonical_format = True
+    c.has_canonical_format = True  # propagates to has_sorted_indices
     return c
 
 
@@ -973,60 +1001,68 @@ def csrgemm2(a, b, d=None, alpha=1, beta=1):
     else:
         a, b, d = _cast_common_type(a, b, d)
 
+    # V2-18: wrap descriptor lifetime in try/finally so a cuSPARSE
+    # error or OOM in the buffer/pointer-array allocations below
+    # cannot leak ``info``.
     info = _cusparse.createCsrgemm2Info()
-    alpha = _numpy.array(alpha, a.dtype).ctypes
-    null_ptr = 0
-    if d is None:
-        beta_data = null_ptr
-        d_descr = MatDescriptor.create()
-        d_nnz = 0
-        d_data = null_ptr
-        d_indptr = null_ptr
-        d_indices = null_ptr
-    else:
-        beta = _numpy.array(beta, a.dtype).ctypes
-        beta_data = beta.data
-        d_descr = d._descr
-        d_nnz = d.nnz
-        d_data = d.data.data.ptr
-        d_indptr = d.indptr.data.ptr
-        d_indices = d.indices.data.ptr
+    try:
+        alpha = _numpy.array(alpha, a.dtype).ctypes
+        null_ptr = 0
+        if d is None:
+            beta_data = null_ptr
+            d_descr = MatDescriptor.create()
+            d_nnz = 0
+            d_data = null_ptr
+            d_indptr = null_ptr
+            d_indices = null_ptr
+        else:
+            beta = _numpy.array(beta, a.dtype).ctypes
+            beta_data = beta.data
+            d_descr = d._descr
+            d_nnz = d.nnz
+            d_data = d.data.data.ptr
+            d_indptr = d.indptr.data.ptr
+            d_indices = d.indices.data.ptr
 
-    buff_size = _call_cusparse(
-        'csrgemm2_bufferSizeExt', a.dtype,
-        handle, m, n, k, alpha.data, a._descr.descriptor, a.nnz,
-        a.indptr.data.ptr, a.indices.data.ptr, b._descr.descriptor, b.nnz,
-        b.indptr.data.ptr, b.indices.data.ptr, beta_data, d_descr.descriptor,
-        d_nnz, d_indptr, d_indices, info)
-    buff = _cupy.empty(buff_size, _numpy.int8)
+        buff_size = _call_cusparse(
+            'csrgemm2_bufferSizeExt', a.dtype,
+            handle, m, n, k, alpha.data, a._descr.descriptor, a.nnz,
+            a.indptr.data.ptr, a.indices.data.ptr, b._descr.descriptor,
+            b.nnz, b.indptr.data.ptr, b.indices.data.ptr, beta_data,
+            d_descr.descriptor, d_nnz, d_indptr, d_indices, info)
+        buff = _cupy.empty(buff_size, _numpy.int8)
 
-    c_nnz = _numpy.empty((), 'i')
-    _cusparse.setPointerMode(handle, _cusparse.CUSPARSE_POINTER_MODE_HOST)
+        c_nnz = _numpy.empty((), 'i')
+        _cusparse.setPointerMode(
+            handle, _cusparse.CUSPARSE_POINTER_MODE_HOST)
 
-    c_descr = MatDescriptor.create()
-    c_indptr = _cupy.empty(m + 1, 'i')
-    _cusparse.xcsrgemm2Nnz(
-        handle, m, n, k, a._descr.descriptor, a.nnz, a.indptr.data.ptr,
-        a.indices.data.ptr, b._descr.descriptor, b.nnz, b.indptr.data.ptr,
-        b.indices.data.ptr, d_descr.descriptor, d_nnz, d_indptr, d_indices,
-        c_descr.descriptor, c_indptr.data.ptr, c_nnz.ctypes.data, info,
-        buff.data.ptr)
+        c_descr = MatDescriptor.create()
+        c_indptr = _cupy.empty(m + 1, 'i')
+        _cusparse.xcsrgemm2Nnz(
+            handle, m, n, k, a._descr.descriptor, a.nnz,
+            a.indptr.data.ptr, a.indices.data.ptr, b._descr.descriptor,
+            b.nnz, b.indptr.data.ptr, b.indices.data.ptr,
+            d_descr.descriptor, d_nnz, d_indptr, d_indices,
+            c_descr.descriptor, c_indptr.data.ptr, c_nnz.ctypes.data,
+            info, buff.data.ptr)
 
-    c_indices = _cupy.empty(int(c_nnz), 'i')
-    c_data = _cupy.empty(int(c_nnz), a.dtype)
-    _call_cusparse(
-        'csrgemm2', a.dtype,
-        handle, m, n, k, alpha.data, a._descr.descriptor, a.nnz,
-        a.data.data.ptr, a.indptr.data.ptr, a.indices.data.ptr,
-        b._descr.descriptor, b.nnz, b.data.data.ptr, b.indptr.data.ptr,
-        b.indices.data.ptr, beta_data, d_descr.descriptor, d_nnz, d_data,
-        d_indptr, d_indices, c_descr.descriptor, c_data.data.ptr,
-        c_indptr.data.ptr, c_indices.data.ptr, info, buff.data.ptr)
+        c_indices = _cupy.empty(int(c_nnz), 'i')
+        c_data = _cupy.empty(int(c_nnz), a.dtype)
+        _call_cusparse(
+            'csrgemm2', a.dtype,
+            handle, m, n, k, alpha.data, a._descr.descriptor, a.nnz,
+            a.data.data.ptr, a.indptr.data.ptr, a.indices.data.ptr,
+            b._descr.descriptor, b.nnz, b.data.data.ptr,
+            b.indptr.data.ptr, b.indices.data.ptr, beta_data,
+            d_descr.descriptor, d_nnz, d_data, d_indptr, d_indices,
+            c_descr.descriptor, c_data.data.ptr, c_indptr.data.ptr,
+            c_indices.data.ptr, info, buff.data.ptr)
 
-    c = cupyx.scipy.sparse.csr_matrix(
-        (c_data, c_indices, c_indptr), shape=(m, n))
-    c._has_canonical_format = True
-    _cusparse.destroyCsrgemm2Info(info)
+        c = cupyx.scipy.sparse.csr_matrix(
+            (c_data, c_indices, c_indptr), shape=(m, n))
+        c.has_canonical_format = True
+    finally:
+        _cusparse.destroyCsrgemm2Info(info)
     return c
 
 
@@ -1272,8 +1308,16 @@ def coo2csr(x):
         _cusparse.xcoo2csr(
             handle, x.row.data.ptr, nnz, m,
             indptr.data.ptr, _cusparse.CUSPARSE_INDEX_BASE_ZERO)
+    # Canonical COO (row-major lex-sorted, no duplicates) maps directly
+    # to canonical CSR: row-grouping preserves the row-major sort.
+    # _skip_buffer_check: indptr was filled either by xcoo2csr or
+    # _build_indptr, both of which produce indptr[-1] == nnz == data.size.
+    has_canonical_format = bool(
+        getattr(x, 'has_canonical_format', False))
     return cupyx.scipy.sparse.csr_matrix._from_parts(
-        x.data, x.col, indptr, x.shape)
+        x.data, x.col, indptr, x.shape,
+        has_canonical_format=has_canonical_format,
+        _skip_buffer_check=True)
 
 
 def coo2csc(x):
@@ -1291,8 +1335,10 @@ def coo2csc(x):
         _cusparse.xcoo2csr(
             handle, x.col.data.ptr, nnz, n,
             indptr.data.ptr, _cusparse.CUSPARSE_INDEX_BASE_ZERO)
+    # _skip_buffer_check: same induction as coo2csr above.
     return cupyx.scipy.sparse.csc_matrix._from_parts(
-        x.data, x.row, indptr, x.shape)
+        x.data, x.row, indptr, x.shape,
+        _skip_buffer_check=True)
 
 
 def csr2coo(x, data, indices):
@@ -1322,9 +1368,19 @@ def csr2coo(x, data, indices):
         _cusparse.xcsr2coo(
             handle, x.indptr.data.ptr, nnz, m, row.data.ptr,
             _cusparse.CUSPARSE_INDEX_BASE_ZERO)
+    # Canonical CSR (sorted indices, no duplicates) => canonical COO:
+    # row from indptr-expansion is non-decreasing and the column order
+    # within each row is preserved.  Propagate the flag so that
+    # downstream ops needing canonical form skip a redundant
+    # ``sum_duplicates`` kernel launch.  Read the *cached* attribute
+    # only -- avoid triggering lazy canonical computation here, since
+    # the caller may not need it.  Most CSRs that come through
+    # ``csr2coo`` were produced by cuSPARSE wraps that already set the
+    # flag explicitly via ``_from_parts``.
+    has_canonical_format = bool(getattr(x, '_has_canonical_format', False))
     A = cupyx.scipy.sparse.coo_matrix._from_parts(
-        data, row, indices, x.shape)
-    A.has_canonical_format = False
+        data, row, indices, x.shape,
+        has_canonical_format=has_canonical_format)
     return A
 
 
@@ -1348,12 +1404,14 @@ def _cupy_transpose_compressed_int64(x, output_cls, out_dim):
     idx_dtype = x.indices.dtype
 
     if nnz == 0:
+        # _skip_buffer_check: 0 == zeros(out_dim+1)[-1].
         return output_cls._from_parts(
             _cupy.empty(0, x.dtype),
             _cupy.empty(0, idx_dtype),
             _cupy.zeros(out_dim + 1, idx_dtype),
             x.shape,
-            has_sorted_indices=True)
+            has_sorted_indices=True,
+            _skip_buffer_check=True)
 
     out_indptr = _build_indptr(x.indices, out_dim, idx_dtype)
     expanded = _indptr_to_coo(x.indptr)
@@ -1361,9 +1419,12 @@ def _cupy_transpose_compressed_int64(x, output_cls, out_dim):
     # Sort by (output major, output minor) for canonical order.
     order = _cupy.lexsort(_cupy.stack([expanded, x.indices]))
 
+    # _skip_buffer_check: data and major arrays are sized to nnz; the
+    # _build_indptr helper produces an indptr whose last entry == nnz.
     return output_cls._from_parts(
         x.data[order], expanded[order], out_indptr, x.shape,
-        has_sorted_indices=True)
+        has_sorted_indices=True,
+        _skip_buffer_check=True)
 
 
 def csr2csc(x):
@@ -1566,7 +1627,7 @@ def dense2csc(x):
         data.data.ptr, indices.data.ptr, indptr.data.ptr)
     # Note that a descriptor is recreated
     csc = cupyx.scipy.sparse.csc_matrix((data, indices, indptr), shape=x.shape)
-    csc._has_canonical_format = True
+    csc.has_canonical_format = True  # propagates to has_sorted_indices
     return csc
 
 
@@ -1613,7 +1674,7 @@ def dense2csr(x):
         data.data.ptr, indptr.data.ptr, indices.data.ptr)
     # Note that a descriptor is recreated
     csr = cupyx.scipy.sparse.csr_matrix((data, indices, indptr), shape=x.shape)
-    csr._has_canonical_format = True
+    csr.has_canonical_format = True  # propagates to has_sorted_indices
     return csr
 
 
@@ -2055,24 +2116,34 @@ def csrsm2(a, b, alpha=1.0, lower=True, unit_diag=False, transa=False,
     a_desc.set_mat_index_base(_cusparse.CUSPARSE_INDEX_BASE_ZERO)
     a_desc.set_mat_fill_mode(fill_mode)
     a_desc.set_mat_diag_type(diag_type)
+    # V2-18: wrap descriptor lifetime in try/finally so OOM in the
+    # workspace allocation or a cuSPARSE error in helper/analysis/
+    # solve cannot leak ``info``.
     info = _cusparse.createCsrsm2Info()
-    ws_size = helper(handle, algo, transa, transb, m, nrhs, a.nnz,
-                     alpha.ctypes.data, a_desc.descriptor, a.data.data.ptr,
-                     a.indptr.data.ptr, a.indices.data.ptr, b.data.ptr, ldb,
-                     info, policy)
-    ws = _cupy.empty((ws_size,), dtype=_numpy.int8)
+    try:
+        ws_size = helper(
+            handle, algo, transa, transb, m, nrhs, a.nnz,
+            alpha.ctypes.data, a_desc.descriptor, a.data.data.ptr,
+            a.indptr.data.ptr, a.indices.data.ptr, b.data.ptr, ldb,
+            info, policy)
+        ws = _cupy.empty((ws_size,), dtype=_numpy.int8)
 
-    analysis(handle, algo, transa, transb, m, nrhs, a.nnz, alpha.ctypes.data,
-             a_desc.descriptor, a.data.data.ptr, a.indptr.data.ptr,
-             a.indices.data.ptr, b.data.ptr, ldb, info, policy, ws.data.ptr)
+        analysis(
+            handle, algo, transa, transb, m, nrhs, a.nnz,
+            alpha.ctypes.data, a_desc.descriptor, a.data.data.ptr,
+            a.indptr.data.ptr, a.indices.data.ptr, b.data.ptr, ldb,
+            info, policy, ws.data.ptr)
 
-    solve(handle, algo, transa, transb, m, nrhs, a.nnz, alpha.ctypes.data,
-          a_desc.descriptor, a.data.data.ptr, a.indptr.data.ptr,
-          a.indices.data.ptr, b.data.ptr, ldb, info, policy, ws.data.ptr)
+        solve(
+            handle, algo, transa, transb, m, nrhs, a.nnz,
+            alpha.ctypes.data, a_desc.descriptor, a.data.data.ptr,
+            a.indptr.data.ptr, a.indices.data.ptr, b.data.ptr, ldb,
+            info, policy, ws.data.ptr)
 
-    # without sync we'd get either segfault or cuda context error
-    _stream.get_current_stream().synchronize()
-    _cusparse.destroyCsrsm2Info(info)
+        # without sync we'd get either segfault or cuda context error
+        _stream.get_current_stream().synchronize()
+    finally:
+        _cusparse.destroyCsrsm2Info(info)
 
 
 def csrilu02(a, level_info=False):
@@ -2126,25 +2197,38 @@ def csrilu02(a, level_info=False):
     desc = MatDescriptor.create()
     desc.set_mat_type(_cusparse.CUSPARSE_MATRIX_TYPE_GENERAL)
     desc.set_mat_index_base(_cusparse.CUSPARSE_INDEX_BASE_ZERO)
+    # V2-17: csrilu02 used to leak ``info`` on every call (no
+    # destroy).  Wrap in try/finally; the ``check`` calls below can
+    # raise ValueError on zero pivots, and the original code skipped
+    # the destroy on those paths too.
     info = _cusparse.createCsrilu02Info()
-    ws_size = helper(handle, m, nnz, desc.descriptor, a.data.data.ptr,
-                     a.indptr.data.ptr, a.indices.data.ptr, info)
-    ws = _cupy.empty((ws_size,), dtype=_numpy.int8)
-    position = _numpy.empty((1,), dtype=_numpy.int32)
-
-    analysis(handle, m, nnz, desc.descriptor, a.data.data.ptr,
-             a.indptr.data.ptr, a.indices.data.ptr, info, policy, ws.data.ptr)
     try:
-        check(handle, info, position.ctypes.data)
-    except Exception:
-        raise ValueError('a({0},{0}) is missing'.format(position[0]))
+        ws_size = helper(
+            handle, m, nnz, desc.descriptor, a.data.data.ptr,
+            a.indptr.data.ptr, a.indices.data.ptr, info)
+        ws = _cupy.empty((ws_size,), dtype=_numpy.int8)
+        position = _numpy.empty((1,), dtype=_numpy.int32)
 
-    solve(handle, m, nnz, desc.descriptor, a.data.data.ptr,
-          a.indptr.data.ptr, a.indices.data.ptr, info, policy, ws.data.ptr)
-    try:
-        check(handle, info, position.ctypes.data)
-    except Exception:
-        raise ValueError('u({0},{0}) is zero'.format(position[0]))
+        analysis(
+            handle, m, nnz, desc.descriptor, a.data.data.ptr,
+            a.indptr.data.ptr, a.indices.data.ptr, info, policy,
+            ws.data.ptr)
+        try:
+            check(handle, info, position.ctypes.data)
+        except Exception:
+            raise ValueError(
+                'a({0},{0}) is missing'.format(position[0]))
+
+        solve(handle, m, nnz, desc.descriptor, a.data.data.ptr,
+              a.indptr.data.ptr, a.indices.data.ptr, info, policy,
+              ws.data.ptr)
+        try:
+            check(handle, info, position.ctypes.data)
+        except Exception:
+            raise ValueError(
+                'u({0},{0}) is zero'.format(position[0]))
+    finally:
+        _cusparse.destroyCsrilu02Info(info)
 
 
 def denseToSparse(x, format='csr'):
@@ -2217,7 +2301,7 @@ def denseToSparse(x, format='csr'):
     desc_y = SpMatDescriptor.create(y)
     _cusparse.denseToSparse_convert(handle, desc_x.desc,
                                     desc_y.desc, algo, buff.data.ptr)
-    y._has_canonical_format = True
+    y.has_canonical_format = True  # propagates to has_sorted_indices
     return y
 
 
@@ -2453,11 +2537,13 @@ def _cupy_spgemm_int64(a, b, alpha):
     total_products = int(products_per_a.sum())  # synchronize!
 
     if total_products == 0:
+        # _skip_buffer_check: 0 == zeros(m+1)[-1].
         return cupyx.scipy.sparse.csr_matrix._from_parts(
             _cupy.empty(0, a.dtype),
             _cupy.empty(0, idx_dtype),
             _cupy.zeros(m + 1, idx_dtype),
-            (m, n))
+            (m, n),
+            _skip_buffer_check=True)
 
     a_src = _cupy.repeat(
         _cupy.arange(a.nnz, dtype=idx_dtype), products_per_a)
@@ -2555,9 +2641,13 @@ def spgemm(a, b, alpha=1):
     # Use _from_parts to preserve int64 index dtype -- the public
     # constructor would downcast empty int64 arrays to int32 via
     # check_contents, causing cuSPARSE to reject mixed index types.
+    # _skip_buffer_check: 0 == zeros(m+1)[-1] (tight) and cuSPARSE
+    # later writes c_indptr in-place during spGEMM_copy -- by then
+    # the c object is rebuilt via the new _from_parts below.
     c = cupyx.scipy.sparse.csr_matrix._from_parts(
         _cupy.empty(0, a.dtype), _cupy.empty(0, idx_dtype),
-        c_empty_indptr, c_shape)
+        c_empty_indptr, c_shape,
+        _skip_buffer_check=True)
 
     handle = _device.get_cusparse_handle()
     mat_a = SpMatDescriptor.create(a)
@@ -2573,62 +2663,77 @@ def spgemm(a, b, alpha=1):
     null_ptr = 0
 
     try:
-        # Analyze the matrices A and B to understand the memory requirement
-        buff1_size = _cusparse.spGEMM_workEstimation(
-            handle, op_a, op_b, alpha.data, mat_a.desc, mat_b.desc, beta.data,
-            mat_c.desc, cuda_dtype, algo, spgemm_descr, 0, null_ptr)
-        buff1 = _cupy.empty(buff1_size, _cupy.int8)
-        _cusparse.spGEMM_workEstimation(
-            handle, op_a, op_b, alpha.data, mat_a.desc, mat_b.desc, beta.data,
-            mat_c.desc, cuda_dtype, algo, spgemm_descr, buff1_size,
-            buff1.data.ptr)
+        try:
+            # Analyze the matrices A and B to understand the memory
+            # requirement
+            buff1_size = _cusparse.spGEMM_workEstimation(
+                handle, op_a, op_b, alpha.data, mat_a.desc, mat_b.desc,
+                beta.data, mat_c.desc, cuda_dtype, algo, spgemm_descr, 0,
+                null_ptr)
+            buff1 = _cupy.empty(buff1_size, _cupy.int8)
+            _cusparse.spGEMM_workEstimation(
+                handle, op_a, op_b, alpha.data, mat_a.desc, mat_b.desc,
+                beta.data, mat_c.desc, cuda_dtype, algo, spgemm_descr,
+                buff1_size, buff1.data.ptr)
+        except _cusparse.CuSparseError as cse:
+            # If the memory required is too high and cuSPARSE >= 12.0,
+            # fall back to ALG2
+            if getVersion() < 12000:
+                raise cse
+            algo = _cusparse.CUSPARSE_SPGEMM_ALG2
+            buff1_size = _cusparse.spGEMM_workEstimation(
+                handle, op_a, op_b, alpha.data, mat_a.desc, mat_b.desc,
+                beta.data, mat_c.desc, cuda_dtype, algo, spgemm_descr, 0,
+                null_ptr)
+            buff1 = _cupy.empty(buff1_size, _cupy.int8)
+            _cusparse.spGEMM_workEstimation(
+                handle, op_a, op_b, alpha.data, mat_a.desc, mat_b.desc,
+                beta.data, mat_c.desc, cuda_dtype, algo, spgemm_descr,
+                buff1_size, buff1.data.ptr)
 
-    except _cusparse.CuSparseError as cse:
-        # If the memory required is too high and cuSPARSE >= 12.0, fall back
-        # to ALG2
-        if getVersion() < 12000:
-            raise cse
-        algo = _cusparse.CUSPARSE_SPGEMM_ALG2
-        buff1_size = _cusparse.spGEMM_workEstimation(
-            handle, op_a, op_b, alpha.data, mat_a.desc, mat_b.desc, beta.data,
-            mat_c.desc, cuda_dtype, algo, spgemm_descr, 0, null_ptr)
-        buff1 = _cupy.empty(buff1_size, _cupy.int8)
-        _cusparse.spGEMM_workEstimation(
-            handle, op_a, op_b, alpha.data, mat_a.desc, mat_b.desc, beta.data,
-            mat_c.desc, cuda_dtype, algo, spgemm_descr, buff1_size,
-            buff1.data.ptr)
+        # Compute the intermediate product of A and B
+        buff2_size = _cusparse.spGEMM_compute(
+            handle, op_a, op_b, alpha.data, mat_a.desc, mat_b.desc,
+            beta.data, mat_c.desc, cuda_dtype, algo, spgemm_descr, 0,
+            null_ptr)
+        buff2 = _cupy.empty(buff2_size, _cupy.int8)
+        _cusparse.spGEMM_compute(
+            handle, op_a, op_b, alpha.data, mat_a.desc, mat_b.desc,
+            beta.data, mat_c.desc, cuda_dtype, algo, spgemm_descr,
+            buff2_size, buff2.data.ptr)
 
-    # Compute the intermediate product of A and B
-    buff2_size = _cusparse.spGEMM_compute(
-        handle, op_a, op_b, alpha.data, mat_a.desc, mat_b.desc, beta.data,
-        mat_c.desc, cuda_dtype, algo, spgemm_descr, 0, null_ptr)
-    buff2 = _cupy.empty(buff2_size, _cupy.int8)
-    _cusparse.spGEMM_compute(
-        handle, op_a, op_b, alpha.data, mat_a.desc, mat_b.desc, beta.data,
-        mat_c.desc, cuda_dtype, algo, spgemm_descr, buff2_size, buff2.data.ptr)
+        # Prepare the arrays for matrix C
+        c_num_rows = _numpy.array(0, dtype='int64')
+        c_num_cols = _numpy.array(0, dtype='int64')
+        c_nnz = _numpy.array(0, dtype='int64')
+        _cusparse.spMatGetSize(mat_c.desc, c_num_rows.ctypes.data,
+                               c_num_cols.ctypes.data, c_nnz.ctypes.data)
+        assert c_shape[0] == int(c_num_rows)
+        assert c_shape[1] == int(c_num_cols)
+        c_nnz = int(c_nnz)
+        c_indptr = c.indptr
+        c_indices = _cupy.empty(c_nnz, idx_dtype)
+        c_data = _cupy.empty(c_nnz, c.dtype)
+        _cusparse.csrSetPointers(
+            mat_c.desc, c_indptr.data.ptr, c_indices.data.ptr,
+            c_data.data.ptr)
 
-    # Prepare the arrays for matrix C
-    c_num_rows = _numpy.array(0, dtype='int64')
-    c_num_cols = _numpy.array(0, dtype='int64')
-    c_nnz = _numpy.array(0, dtype='int64')
-    _cusparse.spMatGetSize(mat_c.desc, c_num_rows.ctypes.data,
-                           c_num_cols.ctypes.data, c_nnz.ctypes.data)
-    assert c_shape[0] == int(c_num_rows)
-    assert c_shape[1] == int(c_num_cols)
-    c_nnz = int(c_nnz)
-    c_indptr = c.indptr
-    c_indices = _cupy.empty(c_nnz, idx_dtype)
-    c_data = _cupy.empty(c_nnz, c.dtype)
-    _cusparse.csrSetPointers(mat_c.desc, c_indptr.data.ptr, c_indices.data.ptr,
-                             c_data.data.ptr)
-
-    # Copy the final product to the matrix C
-    _cusparse.spGEMM_copy(
-        handle, op_a, op_b, alpha.data, mat_a.desc, mat_b.desc, beta.data,
-        mat_c.desc, cuda_dtype, algo, spgemm_descr)
-    c = cupyx.scipy.sparse.csr_matrix._from_parts(
-        c_data, c_indices, c_indptr, c_shape,
-        has_canonical_format=True, has_sorted_indices=True)
-
-    _cusparse.spGEMM_destroyDescr(spgemm_descr)
+        # Copy the final product to the matrix C
+        _cusparse.spGEMM_copy(
+            handle, op_a, op_b, alpha.data, mat_a.desc, mat_b.desc,
+            beta.data, mat_c.desc, cuda_dtype, algo, spgemm_descr)
+        # _skip_buffer_check: c_data and c_indices are sized to c_nnz
+        # from spMatGetSize, and c_indptr was filled by spGEMM_copy
+        # such that c_indptr[-1] == c_nnz.  Tight by construction.
+        c = cupyx.scipy.sparse.csr_matrix._from_parts(
+            c_data, c_indices, c_indptr, c_shape,
+            has_canonical_format=True, has_sorted_indices=True,
+            _skip_buffer_check=True)
+    finally:
+        # spgemm_descr is owned by the cuSPARSE library and must be
+        # released even when the compute / copy steps raise mid-flight
+        # (the previous try/except only covered workEstimation, which
+        # leaked the descriptor on any later failure).  mat_a/mat_b/
+        # mat_c destructors run via Python GC.
+        _cusparse.spGEMM_destroyDescr(spgemm_descr)
     return c

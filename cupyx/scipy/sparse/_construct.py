@@ -181,7 +181,13 @@ def _compressed_sparse_stack(blocks, axis):
     indices = cupy.empty(data.size, dtype=idx_dtype)
     indptr = cupy.empty(sum(b.shape[axis]
                             for b in blocks) + 1, dtype=idx_dtype)
-    last_indptr = idx_dtype(0)
+    # V2-14: keep the running ``last_indptr`` total on device.  Using
+    # a numpy scalar (``idx_dtype(0)``) as the accumulator forced one
+    # D2H sync per block (``numpy_scalar += cupy_0d`` resolves on the
+    # host).  A 0-d cupy scalar stays on device through the loop and
+    # only materializes when the final ``indptr[-1] = last_indptr``
+    # broadcasts.  N-block stack: N → 0 syncs.
+    last_indptr = cupy.zeros((), dtype=idx_dtype)
     sum_dim = 0
     sum_indices = 0
     for b in blocks:
@@ -194,7 +200,7 @@ def _compressed_sparse_stack(blocks, axis):
         indptr[idxs] = b.indptr[:-1]
         indptr[idxs] += last_indptr
         sum_dim += b.shape[axis]
-        last_indptr += b.indptr[-1]
+        last_indptr = last_indptr + b.indptr[-1]
     indptr[-1] = last_indptr
     use_array = _any_sparray(*blocks)
     if axis == 0:
@@ -203,7 +209,11 @@ def _compressed_sparse_stack(blocks, axis):
     else:
         cls = _csc.csc_array if use_array else _csc.csc_matrix
         shape = (constant_dim, sum_dim)
-    return cls._from_parts(data, indices, indptr, shape)
+    # _skip_buffer_check: data.size == sum(b.indices.size) ==
+    # last_indptr == indptr[-1] by construction (the loop above
+    # populated indptr precisely from each block's nnz).
+    return cls._from_parts(
+        data, indices, indptr, shape, _skip_buffer_check=True)
 
 
 def hstack(blocks, format=None, dtype=None):
@@ -308,6 +318,14 @@ def bmat(blocks, format=None, dtype=None):
     # NOTE: We can't follow scipy exactly here
     # since we don't have an `object` datatype
     M = len(blocks)
+    if M == 0:
+        # ``bmat([])`` previously crashed with ``IndexError: list index
+        # out of range`` from the ``len(blocks[0])`` below.  scipy
+        # raises ``ValueError("blocks must be 2-D")``; CuPy's matching
+        # graceful fallback is a 0x0 sparse object, which is more
+        # forgiving and avoids the crash.
+        coo_cls = _coo.coo_array if _any_sparray() else _coo.coo_matrix
+        return coo_cls((0, 0), dtype=dtype)
     N = len(blocks[0])
 
     blocks_flat = []
@@ -357,6 +375,15 @@ def bmat(blocks, format=None, dtype=None):
     _has_int64 = any(
         _block_index_dtype(b) == cupy.int64 for b in blocks_flat)
 
+    # Capture the unanimous input format (if any) before COO
+    # conversion clobbers it.  Used at the bottom to keep CSR/CSC
+    # output when every sparse input shares the format -- otherwise
+    # the slow path below silently downgrades all-CSR / all-CSC bmat
+    # inputs to COO output (F6 / C7).  Dense inputs are skipped since
+    # they have no inherent format preference.
+    _input_formats = {b.format for b in blocks_flat
+                      if _base.issparse(b)}
+
     # convert everything to COO format
     for i in range(M):
         for j in range(N):
@@ -378,11 +405,11 @@ def bmat(blocks, format=None, dtype=None):
                 if bcol_lengths[j+1] == 0:
                     bcol_lengths[j+1] = A.shape[1]
                 elif bcol_lengths[j+1] != A.shape[1]:
-                    msg = ('blocks[:,{j}] has incompatible row dimensions. '
-                           'Got blocks[{i},{j}].shape[1] == {got}, '
-                           'expected {exp}.'.format(i=i, j=j,
-                                                    exp=bcol_lengths[j+1],
-                                                    got=A.shape[1]))
+                    msg = ('blocks[:,{j}] has incompatible column '
+                           'dimensions. Got blocks[{i},{j}].shape[1] '
+                           '== {got}, expected {exp}.'.format(
+                               i=i, j=j, exp=bcol_lengths[j+1],
+                               got=A.shape[1]))
                     raise ValueError(msg)
 
     # Rebuild blocks_flat after COO conversion so that .nnz and
@@ -423,6 +450,14 @@ def bmat(blocks, format=None, dtype=None):
     coo_cls = _coo.coo_array if _use_array else _coo.coo_matrix
     A = coo_cls._from_parts(data, row, col, shape)
     A.has_canonical_format = False
+    # Preserve a unanimous CSR/CSC input format through the slow path
+    # (matches scipy: hstack of all-CSR is CSR, 2-D grid of all-CSC
+    # blocks is CSC, etc.).  Only the existing ``M==1`` / ``N==1``
+    # fast paths above bypass this rebinding -- they already returned.
+    if format is None and len(_input_formats) == 1:
+        only = next(iter(_input_formats))
+        if only in ('csr', 'csc'):
+            format = only
     return A.asformat(format)
 
 
@@ -636,7 +671,20 @@ def kron(A, B, format=None):
     if A.nnz == 0 or B.nnz == 0:
         return coo_cls(out_shape).asformat(format)
 
-    if max(out_shape[0], out_shape[1]) > cupy.iinfo('int32').max:
+    # V2-2: choose the output index dtype.
+    #   * Sparray path: ``_get_index_dtype`` is invoked from a sparray
+    #     instance, where ``check_contents`` is forced off, so the
+    #     input arrays' dtypes are preserved (kron(int64, int64) stays
+    #     int64 even when the output shape would also fit int32).
+    #     Mirrors scipy 1.17 sparse-array semantics.
+    #   * Matrix path: keep the legacy minimum-required policy
+    #     (int32 unless the output shape forces int64).  Matches
+    #     scipy's matrix behaviour.
+    if use_array:
+        dtype = A._get_index_dtype(
+            (A.row, A.col, B.row, B.col),
+            maxval=max(out_shape))
+    elif max(out_shape[0], out_shape[1]) > cupy.iinfo('int32').max:
         dtype = cupy.int64
     else:
         dtype = cupy.int32
@@ -718,14 +766,12 @@ def _to_array(matrix, format=None):
     cls = _array_containers.get(fmt, lambda: _csr.csr_array)()
     if isinstance(matrix, cls):
         return matrix
-    # Convert via CSR then to target format if supported
-    arr = _csr.csr_array(matrix)
-    if fmt and fmt != 'csr':
-        try:
-            arr = arr.asformat(fmt)
-        except NotImplementedError:
-            pass  # keep as CSR
-    return arr
+    # Direct array-class construction now works for every format
+    # (csr/csc/coo/dia all accept a sparse object input), so we go
+    # straight to the target container instead of round-tripping
+    # through CSR -- the old CSR detour caused ``eye_array(N)`` to
+    # silently fall back to CSR when ``csr.todia`` was unimplemented.
+    return cls(matrix)
 
 
 def eye_array(m, n=None, *, k=0, dtype=float, format=None):

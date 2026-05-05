@@ -433,9 +433,19 @@ class IndexMixin:
             x.sum_duplicates()
             self._set_arrayXarray_sparse(i, j, x)
         else:
-            # Make x and i into the same shape
+            # Make x and i into the same shape.
+            # ``cupy.broadcast_arrays(x, i)`` always broadcasts to the
+            # union shape: e.g. ``x.shape ==
+            # (3,)`` and ``i.shape == (3, 1)`` would yield ``(3, 3)``,
+            # which can't be reshaped to ``i.shape`` and crashes with
+            # "cannot reshape (3, 3) -> (3, 1)" (H2).  scipy
+            # short-circuits with a squeeze-comparison: if the squeezed
+            # shapes already match, skip the union broadcast and let
+            # ``reshape(i.shape)`` line them up.
             x = cupy.asarray(x, dtype=self.dtype)
-            x, _ = cupy.broadcast_arrays(x, i)
+            if x.shape != i.shape:
+                if x.squeeze().shape != i.squeeze().shape:
+                    x = cupy.broadcast_to(x, i.shape)
             if x.size == 0:
                 return
             x = x.reshape(i.shape)
@@ -481,11 +491,43 @@ class IndexMixin:
         """
         try:
             x = cupy.asarray(idx, dtype=self.indices.dtype)
-        except (ValueError, TypeError, MemoryError):
+        except (ValueError, TypeError, MemoryError, OverflowError):
+            # ``OverflowError`` -- a Python int that doesn't fit in
+            # ``self.indices.dtype`` (e.g. ``A[[2**32]]`` on an int32
+            # CSR).  The pre-existing ``except`` only listed three
+            # types, so the overflow surfaced as ``OverflowError`` to
+            # the user; remap to ``IndexError`` for consistency with
+            # scipy's "out-of-range index" semantics.
             raise IndexError('invalid index')
 
         if x.ndim not in (1, 2):
             raise IndexError('Index dimension must be <= 2')
+
+        # Out-of-range fancy indices were silently wrapped via ``%``,
+        # which produced wrong-row reads on getitem and wrong-row
+        # writes on setitem (silent data corruption).  Match scipy:
+        # bounds-check the indices and raise IndexError on overflow.
+        # Stack max(x) and min(x) into a single 2-element array so the
+        # D2H read is a single transfer (two separate ``int(x.max())``
+        # / ``int(x.min())`` calls would each round-trip).  Cost: two
+        # reduction kernels + one D2H sync per fancy index access.
+        # synchronize!
+        if x.size:
+            bounds = cupy.stack((x.max(), x.min())).get()  # synchronize!
+            max_val = int(bounds[0])
+            min_val = int(bounds[1])
+            if max_val >= length or min_val < -length:
+                bad = max_val if max_val >= length else min_val
+                raise IndexError(
+                    f'index ({bad}) out of range for axis with size '
+                    f'{length}')
+            if min_val >= 0:
+                # L4c: all indices are non-negative and we already
+                # verified ``max_val < length``, so ``x % length`` is
+                # a no-op.  Skip the kernel launch; saves one
+                # element-wise pass per fancy-index access in the
+                # common (non-negative) case.
+                return x
 
         return x % length
 

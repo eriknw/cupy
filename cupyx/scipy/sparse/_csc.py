@@ -98,12 +98,16 @@ class _csc_base(_compressed._compressed_sparse_matrix):
             return result
         if not (_base.issparse(result) and result.format == 'csr'):
             return result
+        # _skip_buffer_check: ``result`` is a cuSPARSE-built CSR
+        # with tight buffers; we're just rewrapping in the target
+        # array/matrix kind without touching the buffers.
         return target._from_parts(
             result.data, result.indices, result.indptr, result.shape,
             has_canonical_format=getattr(
                 result, '_has_canonical_format', None),
             has_sorted_indices=getattr(
-                result, '_has_sorted_indices', None))
+                result, '_has_sorted_indices', None),
+            _skip_buffer_check=True)
 
     def _matmul_dispatch(self, other):
         from cupyx import cusparse
@@ -132,38 +136,38 @@ class _csc_base(_compressed._compressed_sparse_matrix):
             else:
                 raise AssertionError
         elif _base.issparse(other) and other.format == 'csc':
+            # F11: ``csc @ csc`` returns CSC (matches scipy).
+            # cuSPARSE SpGEMM is CSR-only, so compute as
+            # ``(other.T @ self.T).T``: ``csc.T`` is a CSR view, the
+            # gemm runs in CSR, and the final ``.T`` flips back to
+            # CSC.  Mathematically: ``(B^T @ A^T)^T = A @ B``.
             self.sum_duplicates()
             other.sum_duplicates()
-            is_int64 = (self.indices.dtype == cupy.int64
-                        or other.indices.dtype == cupy.int64)
-            if is_int64:
-                # csrgemm/csrgemm2 are int32-only; route via spgemm,
-                # which has a pure-CuPy fallback for older cuSPARSE.
-                a = self.tocsr()
-                b = other.tocsr()
-                a.sum_duplicates()
-                b.sum_duplicates()
-                return self._as_csr_type(cusparse.spgemm(a, b))
-            if cusparse.check_availability('csrgemm') and not runtime.is_hip:
-                # trans=True is still buggy as of ROCm 4.2.0
-                a = self.T
-                b = other.T
-                return self._as_csr_type(
-                    cusparse.csrgemm(a, b, transa=True, transb=True))
-            elif cusparse.check_availability('csrgemm2'):
-                a = self.tocsr()
-                b = other.tocsr()
-                a.sum_duplicates()
-                b.sum_duplicates()
-                return self._as_csr_type(cusparse.csrgemm2(a, b))
-            elif cusparse.check_availability('spgemm'):
-                a = self.tocsr()
-                b = other.tocsr()
-                a.sum_duplicates()
-                b.sum_duplicates()
-                return self._as_csr_type(cusparse.spgemm(a, b))
-            else:
-                raise AssertionError
+            other_t = other.T
+            self_t = self.T
+            # Lock in the assumption that ``csc.T`` returns a CSR-
+            # format object: if a future change makes ``.T`` lazy or
+            # format-preserving, the dispatch below would loop
+            # forever (csc @ csc -> csc @ csc -> ...).
+            assert other_t.format == 'csr' and self_t.format == 'csr'
+            csr_result = other_t._matmul_dispatch(self_t)
+            target = self._csc_container
+            transposed = csr_result.T
+            if type(transposed) is target:
+                return transposed
+            # _skip_buffer_check: ``transposed`` is a CSC view of the
+            # CSR ``csr_result`` that ``_matmul_dispatch`` produced
+            # (which itself goes through cuSPARSE / spgemm wrappers
+            # that build tight buffers), so ``data.size ==
+            # indptr[-1]`` is inherited.
+            return target._from_parts(
+                transposed.data, transposed.indices, transposed.indptr,
+                transposed.shape,
+                has_canonical_format=getattr(
+                    transposed, '_has_canonical_format', None),
+                has_sorted_indices=getattr(
+                    transposed, '_has_sorted_indices', None),
+                _skip_buffer_check=True)
         elif cupyx.scipy.sparse.issparse(other):
             return self._matmul_dispatch(other.tocsr())
         elif _base.isdense(other):
@@ -257,7 +261,9 @@ class _csc_base(_compressed._compressed_sparse_matrix):
         Args:
             order ({'C', 'F', None}): Whether to store data in C (row-major)
                 order or F (column-major) order. Default is C-order.
-            out: Not supported.
+            out (cupy.ndarray, optional): If provided, the dense output is
+                written into ``out`` in-place and ``out`` is returned.
+                Must match ``self.shape`` and ``self.dtype``.
 
         Returns:
             cupy.ndarray: Dense array representing the same matrix.
@@ -267,34 +273,31 @@ class _csc_base(_compressed._compressed_sparse_matrix):
         """
         from cupyx import cusparse
 
-        if order is None:
-            order = 'C'
-        order = order.upper()
+        _base._check_order_out_compat(order, out)
+        order = 'C' if order is None else order.upper()
+        if order not in ('C', 'F'):
+            raise ValueError('order not understood')
         if self.nnz == 0:
-            return cupy.zeros(shape=self.shape, dtype=self.dtype, order=order)
-
-        x = self.copy()
-        x.has_canonical_format = False  # need to enforce sum_duplicates
-        x.sum_duplicates()
-        if (cusparse.check_availability('sparseToDense')
-                and (not runtime.is_hip or x.nnz > 0)):
-            # On HIP, nnz=0 is problematic as of ROCm 4.2.0
-            y = cusparse.sparseToDense(x)
-            if order == 'F':
-                return y
-            elif order == 'C':
-                return cupy.ascontiguousarray(y)
-            else:
-                raise ValueError('order not understood')
+            result = cupy.zeros(
+                shape=self.shape, dtype=self.dtype, order=order)
         else:
-            # csc2dense and csr2dense returns F-contiguous array.
-            if order == 'C':
-                # To return C-contiguous array, it uses transpose.
-                return cusparse.csr2dense(x.T).T
-            elif order == 'F':
-                return cusparse.csc2dense(x)
+            x = self.copy()
+            x.has_canonical_format = False  # enforce sum_duplicates below
+            x.sum_duplicates()
+            if (cusparse.check_availability('sparseToDense')
+                    and (not runtime.is_hip or x.nnz > 0)):
+                # On HIP, nnz=0 is problematic as of ROCm 4.2.0
+                y = cusparse.sparseToDense(x)
+                # sparseToDense returns F-contiguous; flip if user
+                # asked for C-order.
+                result = y if order == 'F' else cupy.ascontiguousarray(y)
             else:
-                raise ValueError('order not understood')
+                if order == 'C':
+                    # csr2dense returns F-contiguous; transpose for C.
+                    result = cusparse.csr2dense(x.T).T
+                else:  # 'F'
+                    result = cusparse.csc2dense(x)
+        return _base._into_out(result, out, self.shape, self.dtype)
 
     def _add_sparse(self, other, alpha, beta):
         from cupyx import cusparse
@@ -416,12 +419,16 @@ class _csc_base(_compressed._compressed_sparse_matrix):
             indptr = self.indptr.copy()
         else:
             data, indices, indptr = self.data, self.indices, self.indptr
+        # _skip_buffer_check: ``transpose`` reuses self's
+        # data/indices/indptr (or copies); the buffer invariant is
+        # inherited inductively.
         return self._csr_container._from_parts(
             data, indices, indptr, shape,
             has_canonical_format=getattr(
                 self, '_has_canonical_format', None),
             has_sorted_indices=getattr(
-                self, '_has_sorted_indices', None))
+                self, '_has_sorted_indices', None),
+            _skip_buffer_check=True)
 
     def _getrow(self, i):
         """Return a copy of row i as a (1 x n) CSR row vector."""

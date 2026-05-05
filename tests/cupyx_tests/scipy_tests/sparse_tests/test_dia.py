@@ -139,8 +139,12 @@ class TestDiaMatrix(unittest.TestCase):
             self.m.diagonal(3), cupy.array([0], self.dtype))
 
     def test_todia_returns_self(self):
-        # Base ``_spbase.todia`` round-trips via CSR which raises
-        # NotImplementedError for csr_matrix.todia, so DIA must override.
+        # ``_dia_base.todia`` overrides ``_spbase.todia`` so an
+        # already-DIA input returns ``self`` (or a copy) without
+        # round-tripping through CSR -> COO -> DIA.  ``csr.todia`` /
+        # ``coo.todia`` are now implemented (not NotImplementedError
+        # as previously), so the round-trip would still produce a
+        # correct result -- but ``self`` is much faster.
         assert self.m.todia() is self.m
         assert self.m.todia(copy=True) is not self.m
         cupy.testing.assert_array_equal(

@@ -36,6 +36,47 @@ _format_names = {
 }
 
 
+def _into_out(result, out, shape, dtype):
+    """Honor a caller-provided ``out`` ndarray for ``toarray``.
+
+    Returns ``result`` directly when ``out`` is ``None``.  Otherwise
+    validates that ``out.shape`` and ``out.dtype`` match the sparse
+    object, copies the dense result into ``out`` in-place, and returns
+    ``out`` (mirrors :meth:`scipy.sparse._spbase.toarray` semantics).
+
+    Pre-this-fix, ``toarray(out=...)`` silently discarded ``out`` and
+    returned a freshly allocated array — code that pre-allocated ``out``
+    would observe an unwritten zero array, a subtle correctness bug.
+    """
+    if out is None:
+        return result
+    if out.shape != shape:
+        raise ValueError(
+            'out array must have the same shape as the sparse object: '
+            f'got {out.shape}, expected {shape}')
+    if out.dtype != dtype:
+        raise ValueError(
+            'out array must have the same dtype as the sparse object: '
+            f'got {out.dtype}, expected {dtype}')
+    _core.elementwise_copy(result, out)
+    return out
+
+
+def _check_order_out_compat(order, out):
+    """Reject ``order`` + ``out`` simultaneously (matches scipy).
+
+    scipy raises ``ValueError("order cannot be specified if out is not
+    None")`` for any non-``None`` ``order``.  An ``out`` array already
+    fixes the memory layout, so accepting ``order`` here would either
+    be ignored or silently override the user's choice -- both are
+    surprising.  Centralised here so CSR / CSC ``toarray`` use the
+    same error wording as scipy for porting parity.
+    """
+    if out is not None and order is not None:
+        raise ValueError(
+            'order cannot be specified if out is not None')
+
+
 class _spbase:
     """Common base class for all sparse arrays and matrices.
 
@@ -44,6 +85,13 @@ class _spbase:
 
     __array_priority__ = 101
     maxprint = 50
+
+    def __class_getitem__(cls, args):
+        # M5: ``coo_array[int, tuple[int]]``-style typing aliases
+        # (scipy 1.16+).  ``types.GenericAlias`` is the same machinery
+        # ``list[int]`` uses, so the alias is usable in annotations.
+        import types
+        return types.GenericAlias(cls, args)
 
     @property
     def device(self):
@@ -152,6 +200,18 @@ class _spbase:
         return self.tocsr().__rdiv__(other)
 
     def __truediv__(self, other):
+        if _util.isscalarlike(other):
+            # Match scipy ``_data_matrix.__truediv__``: scalar division
+            # preserves format.  scipy promotes float32 / scalar to
+            # float64 (the CSR ``__truediv__`` override has the same
+            # workaround comment); without the explicit ``np.float64``
+            # cast, ``np.result_type(float32, python_float)`` returns
+            # float32 (Python float doesn't promote in numpy's
+            # safe-cast rules) and the result keeps float32 precision.
+            inv = 1.0 / other
+            if self.dtype == numpy.float32:
+                inv = numpy.float64(inv)
+            return self._mul_scalar(inv)
         return self.tocsr().__truediv__(other)
 
     def __rtruediv__(self, other):
@@ -164,19 +224,24 @@ class _spbase:
         return NotImplemented
 
     def __imul__(self, other):
+        # Match scipy's ``_spbase.__imul__``: NotImplemented at the
+        # base; subclasses (``_data_matrix``) implement the scalar
+        # path with the dtype-upcast (M11 / F7).  Keeping this stub
+        # documents that ``*=`` is part of the protocol that
+        # subclasses are expected to handle.
         return NotImplemented
 
     def __idiv__(self, other):
         return self.__itruediv__(other)
 
     def __itruediv__(self, other):
+        # See ``__imul__``.
         return NotImplemented
 
     # Array semantics: ** is element-wise (spmatrix overrides to matrix power)
     def __pow__(self, other):
-        if other == 0:
-            raise NotImplementedError(
-                'zero power is not supported as it would densify the matrix.')
+        # ``power`` owns both the scalar-check (V2-20) and the
+        # zero-check (V2-1); delegate.
         return self.power(other)
 
     # matmul (@) operator
@@ -193,7 +258,18 @@ class _spbase:
         return self._rmatmul_dispatch(other)
 
     def _matmul_dispatch(self, other):
-        """Default: convert to CSR.  Format subclasses override."""
+        """Default: convert to CSR.  Format subclasses override.
+
+        Short-circuits scalars to ``_mul_scalar`` so the result keeps
+        the input format -- before this, ``dia_matrix * 2`` (matrix
+        kind, where ``*`` is ``_matmul_dispatch``) collapsed to
+        ``csr_matrix`` because the base default routed through
+        ``self.tocsr()``.  ``_spbase.multiply`` already had this
+        short-circuit for sparray's element-wise ``*``; this mirrors
+        it for matrix ``*``.
+        """
+        if _util.isscalarlike(other):
+            return self._mul_scalar(other)
         return self.tocsr()._matmul_dispatch(other)
 
     def _rmatmul_dispatch(self, other):
@@ -475,7 +551,14 @@ class _spbase:
         return self.tocsr().minimum(other)
 
     def multiply(self, other):
-        """Point-wise multiplication by another matrix"""
+        """Point-wise multiplication by another matrix or scalar.
+
+        Scalars short-circuit through ``_mul_scalar`` so the result
+        keeps the input format -- before this, ``dia_array * 2.0``
+        collapsed to CSR via ``self.tocsr()``.
+        """
+        if _util.isscalarlike(other):
+            return self._mul_scalar(other)
         if issparse(other):
             other = other.tocsr()
         return self.tocsr().multiply(other)

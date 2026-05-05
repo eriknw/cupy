@@ -6,6 +6,8 @@ try:
 except ImportError:
     _scipy_available = False
 
+import numpy
+
 import cupy
 from cupy import _core
 from cupyx.scipy.sparse import _base
@@ -42,23 +44,99 @@ class _dia_base(_data._data_matrix):
                  *, maxprint=None):
         if maxprint is not None:
             self.maxprint = maxprint
+        if shape is not None and not _util.isshape(shape, nonneg=True):
+            raise ValueError(
+                'invalid shape (must be a 2-tuple of non-negative int)')
         if _scipy_available and scipy.sparse.issparse(arg1):
             x = arg1.todia()
             data = x.data
             offsets = x.offsets
             shape = x.shape
-            dtype = x.dtype
+            # Preserve the caller-supplied dtype so that
+            # ``dia_array(scipy_obj, dtype=cupy.float32)`` actually
+            # casts (the prior code unconditionally rebound dtype to
+            # the scipy source's dtype, silently dropping the kwarg).
+            if dtype is None:
+                dtype = x.dtype
             copy = False
+        elif _base.issparse(arg1):
+            # CuPy sparse object (matrix or array, any format).
+            # Round-trip through ``todia()`` so we extract data /
+            # offsets in the canonical layout regardless of the input
+            # format.  Preserves dtype unless the user asked for a
+            # specific one.
+            x = arg1.todia()
+            data = x.data
+            offsets = x.offsets
+            shape = x.shape
+            if dtype is None:
+                dtype = x.dtype
+            copy = False
+        elif (isinstance(arg1, tuple) and len(arg1) == 2
+                and _util.isshape(arg1)):
+            # See _compressed.py: dispatch on shape-likeness regardless
+            # of sign so negatives raise a precise message instead of
+            # falling through to the (data, offsets) branch.
+            if not _util.isshape(arg1, nonneg=True):
+                raise ValueError(
+                    'invalid shape (must be a 2-tuple of non-negative '
+                    'int)')
+            # ``dia_array((M, N))`` -- empty DIA with the given shape.
+            shape = arg1
+            data = cupy.zeros((0, 0), dtype=dtype or cupy.float64)
+            offsets = cupy.zeros(0, dtype=cupy.intp)
         elif isinstance(arg1, tuple):
             data, offsets = arg1
             if shape is None:
                 raise ValueError('expected a shape argument')
-
+        elif _base.isdense(arg1):
+            # 2-D cupy ndarray -- harvest the non-zero diagonals.
+            # NumPy ndarrays are *not* accepted (per CuPy convention,
+            # no implicit numpy<->cupy conversion for sparse construction;
+            # callers must ``cupy.asarray`` first).
+            # SciPy DIA layout: ``data[i, j]`` is the value at
+            # ``(j - offsets[i], j)`` and ``data.shape[1] == col.max() + 1``
+            # (only as wide as the rightmost stored entry, mirrors
+            # scipy's COO -> DIA recipe).
+            arr = cupy.asarray(arg1)
+            if arr.ndim != 2:
+                raise ValueError(
+                    'dia_matrix from dense array requires 2-D input, '
+                    f'got {arr.ndim}-D')
+            if dtype is not None:
+                arr = arr.astype(dtype, copy=False)
+            shape = arr.shape
+            rows, cols = cupy.nonzero(arr)
+            if rows.size:
+                # Each non-zero (r, c) sits on diagonal k = c - r.
+                # int64 cast: ``c - r`` could overflow int32 for shapes
+                # near 2**31.
+                diags = (cols.astype(cupy.int64)
+                         - rows.astype(cupy.int64))
+                unique_diags, diag_idx = cupy.unique(
+                    diags, return_inverse=True)
+                n_diags = int(unique_diags.size)
+                width = int(cols.max()) + 1  # synchronize!
+                data = cupy.zeros((n_diags, width), dtype=arr.dtype)
+                data[diag_idx.astype(cupy.intp),
+                     cols.astype(cupy.intp)] = arr[rows, cols]
+                offsets = unique_diags
+            else:
+                data = cupy.zeros((0, 0), dtype=arr.dtype)
+                offsets = cupy.zeros(0, dtype=cupy.intp)
+            copy = False
         else:
             raise ValueError(
                 'unrecognized form for dia_matrix constructor')
 
-        data = cupy.array(data, dtype=dtype, copy=copy)
+        # ``cupy.array(..., dtype=dtype, copy=False)`` raises when
+        # ``dtype`` requires a cast (CuPy disallows dtype-changing
+        # zero-copy creation).  Force ``copy=True`` for the cast to
+        # match scipy's "always honor the dtype kwarg" behavior.
+        if dtype is not None and cupy.dtype(dtype) != data.dtype:
+            data = cupy.asarray(data, dtype=dtype)
+        else:
+            data = cupy.array(data, dtype=dtype, copy=copy)
         data = cupy.atleast_2d(data)
         off_dtype = _sputils.get_index_dtype(maxval=max(shape))
         offsets = cupy.array(offsets, dtype=off_dtype)
@@ -82,8 +160,9 @@ class _dia_base(_data._data_matrix):
 
         self.data = data
         self.offsets = offsets
-        if not _util.isshape(shape):
-            raise ValueError('invalid shape (must be a 2-tuple of int)')
+        if not _util.isshape(shape, nonneg=True):
+            raise ValueError(
+                'invalid shape (must be a 2-tuple of non-negative int)')
         self._shape = int(shape[0]), int(shape[1])
 
     def _with_data(self, data, copy=True):
@@ -97,6 +176,84 @@ class _dia_base(_data._data_matrix):
                 (data, self.offsets.copy()), shape=self.shape)
         else:
             return type(self)((data, self.offsets), shape=self.shape)
+
+    def __add__(self, other):
+        """DIA + DIA preserves DIA format (matches scipy).
+
+        Other operand types (scalar, dense, non-DIA sparse) fall back
+        to the base CSR-routed path, which densifies / converts as
+        before.  The DIA-DIA fast path mirrors
+        :meth:`scipy.sparse._dia._dia_base._add_sparse`.
+        """
+        if _util.isscalarlike(other):
+            if other == 0:
+                # ``0`` is the additive identity for sparse arithmetic
+                # -- preserve format and value.
+                return self.copy()
+            # Adding a non-zero scalar densifies; route through CSR
+            # for the existing fallback to handle it.
+            return self.tocsr() + other
+        if _base.issparse(other) and other.format == 'dia':
+            if other.shape != self.shape:
+                raise ValueError('inconsistent shapes')
+            return self._dia_add_sparse(other, sub=False)
+        return self.tocsr() + other
+
+    def __sub__(self, other):
+        """DIA - DIA preserves DIA format.  See :meth:`__add__`."""
+        if _util.isscalarlike(other):
+            if other == 0:
+                return self.copy()
+            return self.tocsr() - other
+        if _base.issparse(other) and other.format == 'dia':
+            if other.shape != self.shape:
+                raise ValueError('inconsistent shapes')
+            return self._dia_add_sparse(other, sub=True)
+        return self.tocsr() - other
+
+    def _dia_add_sparse(self, other, sub):
+        """Add or subtract two DIA matrices, preserving DIA format.
+
+        Mirrors :meth:`scipy.sparse._dia._dia_base._add_sparse`.  Same
+        offsets fast-path skips the offset-union scan; otherwise the
+        result holds the union of offsets.
+        """
+        # Fast path: identical offsets (most common when ``A + A``).
+        # synchronize!
+        if (self.offsets.size == other.offsets.size
+                and bool(cupy.array_equal(
+                    self.offsets, other.offsets))):
+            new_data = (self.data - other.data
+                        if sub else self.data + other.data)
+            return self._with_data(new_data)
+
+        # General path: union of offsets, project each operand's
+        # diagonals into the unified buffer, accumulate.
+        new_offsets = cupy.union1d(self.offsets, other.offsets)
+        self_idx = cupy.searchsorted(new_offsets, self.offsets)
+        other_idx = cupy.searchsorted(new_offsets, other.offsets)
+
+        # Result diag length: needs to hold the largest diagonal that
+        # fits in the matrix (max(M+offset, N) trimmed to N).
+        last_offset = int(new_offsets[-1])  # synchronize!
+        d = min(self.shape[0] + last_offset, self.shape[1])
+        if d <= 0:
+            d = 0
+
+        new_dtype = numpy.result_type(self.data.dtype, other.data.dtype)
+        new_data = cupy.zeros(
+            (len(new_offsets), d), dtype=new_dtype)
+
+        self_d = min(self.data.shape[1], d)
+        other_d = min(other.data.shape[1], d)
+        new_data[self_idx, :self_d] = self.data[:, :self_d]
+        if sub:
+            new_data[other_idx, :other_d] -= other.data[:, :other_d]
+        else:
+            new_data[other_idx, :other_d] += other.data[:, :other_d]
+
+        return self._dia_container(
+            (new_data, new_offsets), shape=self.shape)
 
     def __repr__(self):
         # Match scipy's DIA repr which annotates the diagonal count.

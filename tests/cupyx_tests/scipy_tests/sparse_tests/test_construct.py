@@ -231,16 +231,24 @@ class TestBmat:
     def test_failure_cases(self):
 
         A, B, C, D = self.data()
+        # A is 2x2, B is 2x1, C is 1x1.
+        # bmat([[A], [B]]):  blocks at column 0 disagree on width
+        #     (A.shape[1]==2 vs B.shape[1]==1)  ->  column-dim error.
+        # bmat([[A, C]]):    blocks at row 0 disagree on height
+        #     (A.shape[0]==2 vs C.shape[0]==1)  ->  row-dim error.
+        # Assert the full prefix (not just the suffix) so the
+        # row/column wording stays correct -- the F4 fix in 0c06f73
+        # had this typo'd as "row" for both messages, which only
+        # surfaced when the test prefix was tightened.
 
-        match = r'.*Got blocks\[{}\]\.shape\[{}\] == 1, expected 2'
-
-        # test failure cases
-        message1 = re.compile(match.format('1,0', '1'))
-        with pytest.raises(ValueError, match=message1):
+        match_col = (r'blocks\[:,0\] has incompatible column dimensions\. '
+                     r'Got blocks\[1,0\]\.shape\[1\] == 1, expected 2')
+        with pytest.raises(ValueError, match=re.compile(match_col)):
             _construct.bmat([[A], [B]], dtype=self.dtype)
 
-        message2 = re.compile(match.format('0,1', '0'))
-        with pytest.raises(ValueError, match=message2):
+        match_row = (r'blocks\[0,:\] has incompatible row dimensions\. '
+                     r'Got blocks\[0,1\]\.shape\[0\] == 1, expected 2')
+        with pytest.raises(ValueError, match=re.compile(match_row)):
             _construct.bmat([[A, C]], dtype=self.dtype)
 
 

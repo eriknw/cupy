@@ -52,6 +52,12 @@ def lsqr(A, b):
     # csr_matrix is 2d
     _util._assert_stacked_square(A)
     _util._assert_cupy_array(b)
+    # V2-3: cuSOLVER's csrlsvqr is int32-only.  Without this guard
+    # int64-indexed inputs silently corrupt the result with NaN/inf.
+    # Mirrors the existing guard in ``spsolve`` (which dispatches to
+    # the same backend).
+    from cupyx import cusparse as _cusparse
+    _cusparse._check_int32_indices(A, 'lsqr')
     m = A.shape[0]
     if b.ndim != 1 or len(b) != m:
         raise ValueError('b must be 1-d array whose size is same as A')

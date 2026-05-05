@@ -28,6 +28,66 @@ class _data_matrix(_base._spbase):
     def _with_data(self, data, copy=True):
         raise NotImplementedError
 
+    def _mul_scalar(self, other):
+        """Scale all stored entries by a scalar.  Preserves format
+        (matches SciPy's ``_data._data_matrix._mul_scalar``).
+
+        Promotes the result to a sparse-supported dtype if
+        ``numpy.result_type(self.dtype, other)`` would land outside
+        the ``{bool, float32, float64, complex64, complex128}`` set --
+        otherwise ``bool_csr * 2`` produces an int64 sparse object
+        that no other sparse op can consume.  ``copy=False`` makes
+        the ``astype`` a no-op when ``new_dtype == self.dtype``.
+        """
+        new_dtype = np.result_type(self.dtype, other)
+        if new_dtype.char not in '?fdFD':
+            new_dtype = np.float64
+        return self._with_data(
+            self.data.astype(new_dtype, copy=False) * other)
+
+    def __imul__(self, other):
+        """In-place scalar multiply preserving object identity.
+
+        Overrides :meth:`_spbase.__imul__` to add the ``bool * int ->
+        float64`` dtype upcast (numpy promotion would naturally land
+        on int64, which cuSPARSE doesn't accept for ``data``).  The
+        upcast rebinds ``self.data`` to a new array with the supported
+        dtype but ``self`` itself is unchanged from the caller's
+        perspective.
+        """
+        if _sputils.isscalarlike(other):
+            new_dtype = np.result_type(self.dtype, other)
+            if new_dtype.char not in '?fdFD':
+                new_dtype = np.dtype(np.float64)
+            if new_dtype != self.dtype:
+                # ``self.data *= other`` would fail when the result
+                # dtype differs from ``self.dtype`` (e.g. ``bool *
+                # 2.0``); reassign instead.
+                self.data = self.data.astype(new_dtype) * other
+            else:
+                self.data *= other
+            return self
+        return NotImplemented
+
+    def __itruediv__(self, other):
+        """In-place scalar divide preserving object identity.
+
+        See :meth:`__imul__` for the dtype-upcast rationale.  Uses the
+        ``self.data *= 1/other`` reciprocal trick to keep the in-place
+        semantics (mirrors scipy's ``_data_matrix.__itruediv__``).
+        """
+        if _sputils.isscalarlike(other):
+            recip = 1.0 / other
+            new_dtype = np.result_type(self.dtype, recip)
+            if new_dtype.char not in '?fdFD':
+                new_dtype = np.dtype(np.float64)
+            if new_dtype != self.dtype:
+                self.data = self.data.astype(new_dtype) * recip
+            else:
+                self.data *= recip
+            return self
+        return NotImplemented
+
     def __abs__(self):
         """Elementwise absolute."""
         return self._with_data(abs(self.data))
@@ -56,6 +116,16 @@ class _data_matrix(_base._spbase):
 
         Returns:
             Sparse object with the requested dtype and the same format.
+
+        Note:
+            cuSPARSE-backed arithmetic only accepts the
+            ``{bool, float32, float64, complex64, complex128}`` set;
+            ``astype`` to a dtype outside that set (e.g. ``int32``)
+            succeeds but the result can only be consumed by the
+            pure-CuPy ``toarray`` path.  Subsequent ``+``, ``@``,
+            ``tocsc``, etc. raise ``TypeError`` from the cuSPARSE
+            layer.  Use ``A.toarray().astype(...)`` if a dense int
+            array is the goal.
         """
         dtype = np.dtype(dtype)
         if self.dtype != dtype:
@@ -153,6 +223,25 @@ class _data_matrix(_base._spbase):
             dtype: Type specifier.
 
         """
+        # V2-20: ``A.power(array_exponent)`` would otherwise trigger
+        # ``cupy.array(...) == 0`` below, which raises the confusing
+        # "truth value of an array with more than one element is
+        # ambiguous" error.  scipy raises ``NotImplementedError`` for
+        # non-scalar exponents.
+        if not _sputils.isscalarlike(n):
+            raise NotImplementedError('input is not scalar')
+        # V2-1: ``n == 0`` would densify the matrix (every implicit
+        # zero becomes ``0**0 == 1``).  scipy raises here; the
+        # equivalent guard in ``_spbase.__pow__`` only catches the
+        # ``A ** 0`` operator path, so users calling ``.power(0)``
+        # directly would silently get a sparse object whose stored
+        # entries are 1 and implicit zeros remain 0 -- mathematically
+        # wrong vs the dense ones-matrix scipy produces.
+        if n == 0:
+            raise NotImplementedError(
+                'zero power is not supported as it would densify the '
+                'matrix; use ``cupy.ones(A.shape, dtype=A.dtype)`` '
+                'instead.')
         if dtype is None:
             data = self.data.copy()
         else:
@@ -379,6 +468,63 @@ class _minmax_mixin:
             _util.experimental(api_name)
         return self._min_or_max(axis, out, cupy.min, explicit)
 
+    def nanmax(self, axis=None, out=None, *, explicit=False):
+        """Like :meth:`max` but ignore NaN entries (matches scipy 1.17).
+
+        Currently supported for ``axis=None`` only.  For per-axis
+        reductions, drop the NaN entries explicitly before reducing
+        (e.g. via ``A._with_data(A.data[~cupy.isnan(A.data)])``).
+
+        .. seealso:: :meth:`scipy.sparse.csr_array.nanmax`
+        """
+        if axis is not None:
+            raise NotImplementedError(
+                'nanmax with axis is not yet implemented for cupy '
+                'sparse')
+        if out is not None:
+            raise ValueError(
+                "Sparse matrices do not support an 'out' parameter.")
+        return self._nan_min_or_max(cupy.maximum, explicit, op_max=True)
+
+    def nanmin(self, axis=None, out=None, *, explicit=False):
+        """Like :meth:`min` but ignore NaN entries.  See :meth:`nanmax`."""
+        if axis is not None:
+            raise NotImplementedError(
+                'nanmin with axis is not yet implemented for cupy '
+                'sparse')
+        if out is not None:
+            raise ValueError(
+                "Sparse matrices do not support an 'out' parameter.")
+        return self._nan_min_or_max(cupy.minimum, explicit, op_max=False)
+
+    def _nan_min_or_max(self, scalar_op, explicit, *, op_max):
+        if 0 in self.shape:
+            raise ValueError('zero-size array to reduction operation')
+        zero = cupy.zeros((), dtype=self.dtype)
+        if self.nnz == 0:
+            return zero
+        self.sum_duplicates()
+        # Filter explicit NaN entries before reducing.  scipy uses
+        # ``np.fmax`` / ``np.fmin`` whose ``reduce`` already ignores
+        # NaN, but cupy doesn't expose ``fmax.reduce``.  Filtering
+        # before ``max``/``min`` is equivalent.
+        data = self.data
+        if data.dtype.kind in 'fc':
+            data = data[~cupy.isnan(data)]
+        has_implicit_zero = self.nnz != internal.prod(self.shape)
+        if data.size == 0:
+            # All explicit entries were NaN.  scipy: NaN unless an
+            # implicit zero is present and not ``explicit``.
+            if explicit or not has_implicit_zero:
+                return cupy.full((), float('nan'), dtype=self.dtype)
+            return zero
+        m = (cupy.max(data) if op_max else cupy.min(data))
+        if explicit:
+            return m
+        if has_implicit_zero:
+            m = scalar_op(zero, m)
+        return m
+
     def argmax(self, axis=None, out=None):
         """Returns indices of maximum elements along an axis.
 
@@ -432,14 +578,26 @@ class _minmax_mixin:
 def _install_ufunc(func_name):
 
     def f(self):
-        if func_name == "sign":
-            # scipy.sparse_matrix.sign behaves compatible with
-            # numpy.sign in NumPy 1.x series.
-            ufunc = cupy._math.misc._legacy_sign
+        # V2-25: scipy 1.16+ uses numpy 2.x ``sign`` semantics for
+        # complex values (``z / abs(z)``); scipy 1.15- used the
+        # numpy 1.x semantics (``1+0j``).  CuPy's old code hardcoded
+        # the legacy path, which now diverges from current scipy.
+        #
+        # ``cupy.sign`` follows numpy 2.x semantics for non-zero
+        # complex inputs, but has a known divergence for ``0+0j``:
+        # numpy returns ``0+0j``, cupy returns ``nan+nanj`` (it
+        # computes ``z/abs(z)`` literally, which is ``0/0`` for
+        # ``0+0j``).  Mask explicit zeros so sparse matrices with
+        # zero-valued stored entries don't surface NaN.  Cost: one
+        # extra elementwise pass on the data array, only on the
+        # complex-sign code path.
+        if func_name == 'sign' and self.data.dtype.kind == 'c':
+            zero = self.data.dtype.type(0)
+            result = cupy.where(self.data == zero, zero,
+                                cupy.sign(self.data))
         else:
             ufunc = getattr(cupy, func_name)
-
-        result = ufunc(self.data)
+            result = ufunc(self.data)
         return self._with_data(result)
 
     f.__doc__ = 'Elementwise %s.' % func_name

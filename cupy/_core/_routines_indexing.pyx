@@ -940,11 +940,15 @@ cdef _scatter_op_single(
         _scatter_add_kernel(
             v, indices, cdim, rdim, adim, a.reduced_view())
     elif op == 'sub':
+        # M7b: ``atomicSub`` is only defined for int32 / uint32 (no
+        # long-long overload in CUDA).  int64 / uint64 would need a
+        # separate kernel using ``atomicAdd`` with negation; for now
+        # the error tells the user the supported types.
         if not issubclass(v.dtype.type,
                           (numpy.int32, numpy.uint32,
                            numpy.intc, numpy.uintc)):
             raise TypeError(
-                'cupy.subtract.at only supports int32, uint32, as data type')
+                'cupy.subtract.at only supports int32, uint32 as data type')
         _scatter_sub_kernel(
             v, indices, cdim, rdim, adim, a.reduced_view())
     elif op == 'max':
