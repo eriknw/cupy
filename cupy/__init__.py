@@ -810,6 +810,8 @@ from cupy._core import RawKernel  # NOQA
 from cupy._core import RawModule  # NOQA
 from cupy._core._reduction import ReductionKernel  # NOQA
 
+from cupy._core._dtype import make_aligned_dtype  # NOQA
+
 # -----------------------------------------------------------------------------
 # DLPack
 # -----------------------------------------------------------------------------
@@ -884,7 +886,7 @@ def get_array_module(*args):
     """
     import cupyx
     for arg in args:
-        if isinstance(arg, (ndarray, cupyx.scipy.sparse.spmatrix,
+        if isinstance(arg, (ndarray, cupyx.scipy.sparse._spbase,
                             _core.fusion._FusionVarArray,
                             _core.new_fusion._ArrayProxy)):
             return _cupy

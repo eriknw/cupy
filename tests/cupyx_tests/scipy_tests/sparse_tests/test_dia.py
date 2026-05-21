@@ -86,7 +86,7 @@ class TestDiaMatrix(unittest.TestCase):
         n = _make_complex(cupy, sparse, self.dtype)
         cupy.testing.assert_array_equal(n.conjugate().data, n.data.conj())
 
-    @testing.with_requires('scipy>=1.14')
+    @testing.with_requires('scipy')
     def test_str(self):
         # The exact DIA __str__ format differs across SciPy versions:
         # SciPy 1.14-1.16 use diagonal-major order; SciPy 1.17 switched
@@ -263,10 +263,10 @@ class TestDiaMatrixScipyComparison(unittest.TestCase):
 
     @testing.numpy_cupy_equal(sp_name='sp')
     def test_nnz_axis(self, xp, sp):
-        # CuPy fixes scipy gh-23055 (DIA nnz with empty data buffer)
-        # ahead of scipy: bound the diagonal length by the actual data
-        # buffer.  scipy < 1.17 over-counts empty DIAs, so the
-        # comparison would disagree for the empty variant; skip it.
+        # CuPy bounds the diagonal length by the actual data buffer
+        # length, matching the scipy 1.17 fix (scipy/scipy#23055).
+        # Earlier scipy returns the maximum potential count from
+        # offsets/shape, so empty-data cases would mismatch.
         if self.make_method == '_make_empty':
             from packaging.version import parse as _v
             if _v(scipy.__version__) < _v('1.17'):
@@ -284,12 +284,6 @@ class TestDiaMatrixScipyComparison(unittest.TestCase):
     def test_toarray(self, xp, sp):
         m = self.make(xp, sp, self.dtype)
         return m.toarray()
-
-    @testing.with_requires('scipy<1.14')
-    @testing.numpy_cupy_allclose(sp_name='sp')
-    def test_A(self, xp, sp):
-        m = self.make(xp, sp, self.dtype)
-        return m.A
 
     @testing.with_requires('scipy>=1.16')
     @testing.numpy_cupy_allclose(sp_name='sp')
@@ -350,10 +344,8 @@ class TestDiaMatrixScipyComparison(unittest.TestCase):
         m = self.make(xp, sp, self.dtype)
         return m.transpose()
 
-    @testing.with_requires('scipy>=1.5.0')
+    @testing.with_requires('scipy')
     def test_diagonal_error(self):
-        # Before scipy 1.5.0 dia_matrix diagonal raised
-        # `ValueError`, now returns empty array.
         # Check #3469
         for xp, sp in ((numpy, scipy.sparse), (cupy, sparse)):
             m = _make(xp, sp, self.dtype)
